@@ -1,0 +1,116 @@
+<meta charset="utf-8">
+<title>JEPA Tennis — human vs world model</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0d10; color: #d7dae0;
+         font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 24px; }
+  h1 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: .04em; }
+  #screen { image-rendering: pixelated; border: 1px solid #2a2f3a; border-radius: 4px; }
+  .row { display: flex; gap: 28px; align-items: flex-start; }
+  .panel { min-width: 260px; }
+  .k { color: #7d8494; }
+  .v { color: #e8ebf0; }
+  table { border-collapse: collapse; }
+  td { padding: 1px 10px 1px 0; white-space: nowrap; }
+  #status { color: #8b93a3; }
+  .live { color: #5ec27a; }
+  .warn { color: #d9a44a; }
+  kbd { background: #1a1e26; border: 1px solid #2a2f3a; border-radius: 3px;
+        padding: 1px 5px; color: #c8cdd6; }
+</style>
+
+<h1>JEPA Tennis — <span class="k">model plays top (second_0), you play bottom (first_0)</span></h1>
+
+<div class="row">
+  <canvas id="screen" width="320" height="420"></canvas>
+
+  <div class="panel">
+    <table>
+      <tr><td class="k">status</td><td class="v" id="status">connecting…</td></tr>
+      <tr><td class="k">score (jepa / you)</td><td class="v" id="score">0 / 0</td></tr>
+      <tr><td class="k">tick</td><td class="v" id="tick">0</td></tr>
+      <tr><td class="k">jepa action</td><td class="v" id="ja">—</td></tr>
+      <tr><td class="k">your action</td><td class="v" id="ha">—</td></tr>
+      <tr><td class="k">dx (ball − paddle)</td><td class="v" id="dx">—</td></tr>
+      <tr><td class="k">jepa on top?</td><td class="v" id="top">—</td></tr>
+    </table>
+
+    <p class="k" style="margin-bottom:4px">predicted state (from pixels)</p>
+    <table id="pred"></table>
+
+    <p class="k">
+      <kbd>←</kbd><kbd>→</kbd> move &nbsp; <kbd>space</kbd> swing &nbsp; <kbd>↑</kbd><kbd>↓</kbd> up/down
+    </p>
+    <p class="k" style="font-size:12px">
+      ball_y is arc-height in this ROM, not court-y — the policy ignores it and
+      aligns on ball_x only.
+    </p>
+  </div>
+</div>
+
+<script>
+// ALE full action set ids used here. FIRE locks movement, so it is a swing.
+const NOOP = 0, FIRE = 1, UP = 2, RIGHT = 3, LEFT = 4, DOWN = 5;
+const ACTION_NAME = {0:'NOOP', 1:'FIRE', 2:'UP', 3:'RIGHT', 4:'LEFT', 5:'DOWN'};
+
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+const $ = id => document.getElementById(id);
+
+const held = new Set();
+addEventListener('keydown', e => {
+  if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+  held.add(e.code);
+});
+addEventListener('keyup', e => held.delete(e.code));
+
+// One key -> one discrete action. Swing wins over movement, matching the ROM:
+// firing locks movement, so pressing both is not a compound action.
+function currentAction() {
+  if (held.has('Space')) return FIRE;
+  if (held.has('ArrowRight')) return RIGHT;
+  if (held.has('ArrowLeft')) return LEFT;
+  if (held.has('ArrowUp')) return UP;
+  if (held.has('ArrowDown')) return DOWN;
+  return NOOP;
+}
+
+const url = (location.protocol === 'https:' ? 'wss://' : 'ws://')
+          + location.host + '/ws-tennis';
+const ws = new WebSocket(url);
+const img = new Image();
+img.onload = () => {
+  if (canvas.width !== img.width) { canvas.width = img.width; canvas.height = img.height; }
+  ctx.drawImage(img, 0, 0);
+};
+
+ws.onopen = () => { $('status').textContent = 'connected'; $('status').className = 'v live'; };
+ws.onclose = () => { $('status').textContent = 'disconnected'; $('status').className = 'v warn'; };
+ws.onerror = () => { $('status').textContent = 'error'; $('status').className = 'v warn'; };
+
+ws.onmessage = ev => {
+  const m = JSON.parse(ev.data);
+  if (m.error) { $('status').textContent = m.error; $('status').className = 'v warn'; return; }
+
+  img.src = 'data:image/png;base64,' + m.frame_png;
+
+  // The server drives the clock; every frame it sends, we answer with a key state.
+  ws.send(JSON.stringify({ action: currentAction() }));
+
+  $('status').textContent = m.history_ready ? 'playing' : 'filling history…';
+  $('status').className = m.history_ready ? 'v live' : 'v warn';
+  $('score').textContent = `${m.score.jepa} / ${m.score.human}`;
+  $('tick').textContent = m.tick;
+  $('ja').textContent = ACTION_NAME[m.jepa_action] ?? m.jepa_action;
+  $('ha').textContent = ACTION_NAME[m.human_action] ?? m.human_action;
+  $('dx').textContent = m.dx === null || m.dx === undefined ? '—' : m.dx.toFixed(1);
+  $('top').textContent = m.jepa_is_top ? 'yes' : 'no (ends swapped)';
+
+  if (m.pred_state) {
+    $('pred').innerHTML = Object.entries(m.pred_state)
+      .map(([k, v]) => `<tr><td class="k">${k}</td><td class="v">${v.toFixed(1)}</td></tr>`)
+      .join('');
+  }
+};
+</script>

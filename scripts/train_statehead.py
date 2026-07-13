@@ -18,29 +18,36 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 from model.jepa_pool import JEPAPool, EMBED_DIM, HISTORY_SIZE
+from model.lance_data import train_val_split
 
 
-class PongDataset(Dataset):
-    """Yields (frames_window, actions_window, states_window) where window = HISTORY_SIZE+1."""
-    def __init__(self, frames, actions, states, history=HISTORY_SIZE):
-        self.frames = frames
-        self.actions = actions
-        self.states = states
-        self.history = history
-        self.indices = list(range(history, len(frames) - 1))
+def _init_worker(_worker_id: int) -> None:
+    """One intra-op thread per worker; 16 workers x N threads only thrashes."""
+    torch.set_num_threads(1)
 
-    def __len__(self):
-        return len(self.indices)
 
-    def __getitem__(self, idx):
-        i = self.indices[idx]
-        f = self.frames[i - self.history:i + 1]
-        a = self.actions[i - self.history:i + 1]
-        s = self.states[i - self.history:i + 1]
-        return f, a, s
+def make_loader(ds, batch_size: int, shuffle: bool, num_workers: int) -> DataLoader:
+    """Build a DataLoader whose workers can safely re-enter Lance.
+
+    Reading the dataset in the parent starts Lance's global Tokio runtime, and
+    fork() clones only the calling thread: a mutex held by a runtime thread at
+    fork time stays locked forever in the child, which then deadlocks on its
+    first read. Opening a fresh lance.dataset() per worker does not help, since
+    the runtime is process-global. Spawn gives each worker its own runtime.
+    """
+    kwargs = {}
+    if num_workers > 0:
+        kwargs = dict(
+            persistent_workers=True,
+            multiprocessing_context="spawn",
+            worker_init_fn=_init_worker,
+            prefetch_factor=4,
+        )
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                      num_workers=num_workers, pin_memory=True, **kwargs)
 
 
 def freeze_everything_except_state_head(model: JEPAPool) -> list[str]:
@@ -71,19 +78,65 @@ def freeze_everything_except_state_head(model: JEPAPool) -> list[str]:
     return frozen_modules
 
 
+@torch.no_grad()
+def precompute_features(model: JEPAPool, loader, device):
+    """Run the frozen backbone once and cache exactly what the state head consumes.
+
+    With the backbone frozen and in eval mode, and no augmentation in the loader,
+    pred_emb is a pure function of the window. Recomputing it every epoch decodes
+    the same PNGs and re-runs the same 13M-param CNN to get the same numbers, so
+    we do it once. Also skips SIGReg, which model.forward computes and discards.
+
+    Returns (feats (N, HISTORY_SIZE, embed_dim), targets (N, HISTORY_SIZE,
+    state_dim), mean pred_loss) -- pred_loss is constant, so it is reported once.
+    """
+    feats, targets = [], []
+    pred_sum, n = 0.0, 0
+    total = len(loader)
+    for step, (xb, ab, sb) in enumerate(loader, 1):
+        xb = xb.to(device, non_blocking=True)
+        ab = ab.to(device, non_blocking=True)
+        sb = sb.to(device, non_blocking=True)
+        b = xb.size(0)
+
+        emb = model.encode(xb)
+        action_emb = model.encode_actions(ab)
+        pred_raw = model.predictor(emb[:, :HISTORY_SIZE], action_emb[:, :HISTORY_SIZE])
+        pred_emb = model.pred_projector(
+            pred_raw.reshape(b * HISTORY_SIZE, -1)).reshape(b, HISTORY_SIZE, -1)
+
+        pred_sum += (pred_emb - emb[:, 1:HISTORY_SIZE + 1]).pow(2).mean().item() * b
+        n += b
+
+        feats.append(pred_emb)
+        targets.append(sb[:, 1:HISTORY_SIZE + 1])
+
+        if step == 1 or step == total or step % max(1, total // 10) == 0:
+            print(f"    encoding {step}/{total} ({100.0 * step / total:5.1f}%)", flush=True)
+
+    return torch.cat(feats), torch.cat(targets), pred_sum / n
+
+
 def main():
     pa = argparse.ArgumentParser()
-    pa.add_argument("--data", required=True, help="Path to pong_v1.npz")
+    pa.add_argument("--data", required=True, help="Path to a .lance dataset")
     pa.add_argument("--init", required=True, help="Init checkpoint (lepong_v1.pt)")
     pa.add_argument("--output", required=True, help="Output checkpoint path")
     pa.add_argument("--epochs", type=int, default=20)
     pa.add_argument("--batch", type=int, default=128)
     pa.add_argument("--lr", type=float, default=1e-3,
                     help="Higher than full-model lr because only ~2K params train")
-    pa.add_argument("--state-dim", type=int, default=10)
+    pa.add_argument("--limit", type=int, default=None,
+                    help="Train on only the first N rows (e.g. 100000)")
     pa.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    pa.add_argument("--num-workers", type=int, default=2)
+    pa.add_argument("--num-workers", type=int, default=8)
     pa.add_argument("--val-frac", type=float, default=0.1)
+    pa.add_argument("--min-ball-x", type=float, default=None,
+                    help="Drop target frames whose ball_x is below this (ALE parks the "
+                         "ball at ~1-4 between points). On tennis 59%% of frames are "
+                         "parked, and training on them lets the head score corr 0.81 by "
+                         "separating dead-from-live while resolving the ball during a "
+                         "rally at only corr 0.31. Try 5.")
     args = pa.parse_args()
 
     device = torch.device(args.device)
@@ -95,51 +148,26 @@ def main():
     print(f"  epochs:  {args.epochs}", flush=True)
     print(f"  batch:   {args.batch}", flush=True)
     print(f"  lr:      {args.lr}", flush=True)
-    print(f"  state_dim: {args.state_dim}", flush=True)
+    print(f"  limit:   {args.limit}", flush=True)
 
-    # Load data
+    # Load data (lazy: PNG frames are decoded per-window in the loader workers)
     print("\nLoading data...", flush=True)
-    d = np.load(args.data)
-    print(f"  npz keys: {list(d.keys())}", flush=True)
-    frames = torch.from_numpy(d["frames"]).float().permute(0, 3, 1, 2) / 255.0
-    actions = torch.from_numpy(d["actions"]).float()
-    states = torch.from_numpy(d["states"]).float()
-    print(f"  frames: {frames.shape}, actions: {actions.shape}, states: {states.shape}", flush=True)
-    actual_state_dim = states.shape[1]
-    if actual_state_dim != args.state_dim:
-        print(f"  NOTE: state_dim arg={args.state_dim}, actual={actual_state_dim}. Using actual.", flush=True)
-        args.state_dim = actual_state_dim
-
-    # Normalize states (per-dim)
-    state_mean = states.mean(dim=0)
-    state_std = states.std(dim=0).clamp(min=1e-6)
-    states_norm = (states - state_mean) / state_std
+    train_ds, val_ds = train_val_split(args.data, HISTORY_SIZE,
+                                       val_frac=args.val_frac, limit=args.limit)
+    args.state_dim = train_ds.state_dim
+    state_mean, state_std = train_ds.state_mean, train_ds.state_std
+    print(f"  game: {train_ds.game}  num_actions: {train_ds.num_actions}", flush=True)
+    print(f"  state cols: {train_ds.state_cols}", flush=True)
     print(f"  state mean: {state_mean.tolist()}", flush=True)
     print(f"  state std:  {state_std.tolist()}", flush=True)
 
-    # Train/val split
-    n = len(frames)
-    n_val = int(n * args.val_frac)
-    n_train = n - n_val
-    train_frames = frames[:n_train]
-    train_actions = actions[:n_train]
-    train_states = states_norm[:n_train]
-    val_frames = frames[n_train:]
-    val_actions = actions[n_train:]
-    val_states = states_norm[n_train:]
-    print(f"  train: {n_train}, val: {n_val}", flush=True)
-
-    train_ds = PongDataset(train_frames, train_actions, train_states)
-    val_ds = PongDataset(val_frames, val_actions, val_states)
-    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True)
+    train_loader = make_loader(train_ds, args.batch, True, args.num_workers)
+    val_loader = make_loader(val_ds, args.batch, False, args.num_workers)
     print(f"  train windows: {len(train_ds)}, val windows: {len(val_ds)}", flush=True)
 
     # Model
     print(f"\nBuilding JEPAPool with state_dim={args.state_dim}...", flush=True)
-    model = JEPAPool(state_dim=args.state_dim).to(device)
+    model = JEPAPool(state_dim=args.state_dim, num_actions=train_ds.num_actions).to(device)
     n_params_total = sum(p.numel() for p in model.parameters())
     print(f"  total params: {n_params_total:,}", flush=True)
 
@@ -173,12 +201,8 @@ def main():
     opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-3,
                             betas=(0.9, 0.95))
 
-    state_names = ["ball_x", "ball_y", "ball_vx", "ball_vy", "pad_l", "pad_r",
-                   "score_l", "score_r", "speed", "rally"]
-    state_names = state_names[:args.state_dim]
+    state_names = train_ds.state_cols
 
-    print("\n=== TRAINING (state head only) ===", flush=True)
-    t0 = time.time()
     # Put the frozen modules into eval mode so BatchNorm running stats don't update
     model.encoder.eval()
     model.projector.eval()
@@ -186,55 +210,74 @@ def main():
     model.predictor.eval()
     model.pred_projector.eval()
 
+    # One pass over the pixels. After this the PNGs and the CNN are never touched
+    # again, so each epoch below is a linear pass over cached embeddings.
+    print("\n=== ENCODING (frozen backbone, one pass) ===", flush=True)
+    t_pre = time.time()
+    print("  train:", flush=True)
+    tr_feats, tr_tgts, train_pred_loss = precompute_features(model, train_loader, device)
+    print("  val:", flush=True)
+    va_feats, va_tgts, val_pred_loss = precompute_features(model, val_loader, device)
+    print(f"  train feats: {tuple(tr_feats.shape)} ({tr_feats.numel() * 4 / 1e6:.0f} MB)", flush=True)
+    print(f"  val   feats: {tuple(va_feats.shape)} ({va_feats.numel() * 4 / 1e6:.0f} MB)", flush=True)
+    print(f"  pred loss (frozen, constant): train={train_pred_loss:.4f} val={val_pred_loss:.4f}", flush=True)
+    print(f"  encoded in {time.time() - t_pre:.0f}s", flush=True)
+
+    if args.min_ball_x is not None:
+        if "ball_x" not in state_names:
+            sys.exit(f"--min-ball-x needs a ball_x column; have {state_names}")
+        bi = state_names.index("ball_x")
+        mu, sd = state_mean[bi].to(device), state_std[bi].to(device)
+
+        def keep_live(feats, tgts):
+            """Flatten (N, H, ·) to rows and drop parked-ball target frames."""
+            f = feats.reshape(-1, feats.size(-1))
+            t = tgts.reshape(-1, tgts.size(-1))
+            m = (t[:, bi] * sd + mu) >= args.min_ball_x
+            return f[m], t[m], int(m.sum()), m.numel()
+
+        tr_feats, tr_tgts, ntr, dtr = keep_live(tr_feats, tr_tgts)
+        va_feats, va_tgts, nva, dva = keep_live(va_feats, va_tgts)
+        print(f"\n  live filter (ball_x >= {args.min_ball_x}): "
+              f"train {ntr}/{dtr} ({100 * ntr / dtr:.1f}%) "
+              f"val {nva}/{dva} ({100 * nva / dva:.1f}%) rows kept", flush=True)
+        if ntr == 0 or nva == 0:
+            sys.exit("live filter removed every row; lower --min-ball-x")
+
+    print("\n=== TRAINING (state head only) ===", flush=True)
+    t0 = time.time()
+    n_train = tr_feats.size(0)
+
     for epoch in range(args.epochs):
         model.state_head.train()
-        sum_pred, sum_state, n_b = 0.0, 0.0, 0
+        perm = torch.randperm(n_train, device=device)
+        sum_state, n_b = 0.0, 0
 
-        for xb, ab, sb in train_loader:
-            xb = xb.to(device, non_blocking=True)
-            ab = ab.to(device, non_blocking=True)
-            sb = sb.to(device, non_blocking=True)
+        for i in range(0, n_train, args.batch):
+            idx = perm[i:i + args.batch]
+            fb, tb = tr_feats[idx], tr_tgts[idx]
 
-            out = model(xb, ab, sb)
-            pred_loss, _sigreg_loss, _, _, state_loss, _, _ = out
-            total = state_loss
+            state_loss = (model.state_head(fb) - tb).pow(2).mean()
 
             opt.zero_grad()
-            total.backward()
+            state_loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             opt.step()
 
-            sum_pred += pred_loss.item() * len(xb)
-            sum_state += state_loss.item() * len(xb)
-            n_b += len(xb)
+            sum_state += state_loss.item() * len(fb)
+            n_b += len(fb)
 
-        avg_pred = sum_pred / n_b
+        avg_pred = train_pred_loss
         avg_state = sum_state / n_b
 
-        # Validation
+        # Validation -- the whole cached val set fits in one forward
         model.state_head.eval()
-        val_state_preds = []
-        val_state_targets = []
-        val_pred_sum = 0.0
-        val_state_sum = 0.0
-        val_n = 0
         with torch.no_grad():
-            for xb, ab, sb in val_loader:
-                xb = xb.to(device, non_blocking=True)
-                ab = ab.to(device, non_blocking=True)
-                sb = sb.to(device, non_blocking=True)
-                out = model(xb, ab, sb)
-                pred_loss, _, _, _, state_loss, state_pred, tgt_states = out
-                val_pred_sum += pred_loss.item() * len(xb)
-                val_state_sum += state_loss.item() * len(xb)
-                val_n += len(xb)
-                val_state_preds.append(state_pred.reshape(-1, args.state_dim).cpu())
-                val_state_targets.append(tgt_states.reshape(-1, args.state_dim).cpu())
+            val_pred_states = model.state_head(va_feats)
+            val_state_loss = (val_pred_states - va_tgts).pow(2).mean().item()
 
-        val_pred_loss = val_pred_sum / val_n
-        val_state_loss = val_state_sum / val_n
-        all_p = torch.cat(val_state_preds)
-        all_t = torch.cat(val_state_targets)
+        all_p = val_pred_states.reshape(-1, args.state_dim).cpu()
+        all_t = va_tgts.reshape(-1, args.state_dim).cpu()
         corrs = []
         for i in range(args.state_dim):
             if all_t[:, i].std() < 1e-6:
@@ -245,7 +288,7 @@ def main():
 
         elapsed = time.time() - t0
         print(f"Epoch {epoch+1:3d}/{args.epochs}  "
-              f"train: pred={avg_pred:.4f} (frozen, should be flat) state={avg_state:.4f}  "
+              f"train: pred={avg_pred:.4f} (frozen, constant) state={avg_state:.4f}  "
               f"val: pred={val_pred_loss:.4f} state={val_state_loss:.4f}  "
               f"({elapsed:.0f}s)", flush=True)
         if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == args.epochs - 1:
@@ -253,7 +296,8 @@ def main():
             print(f"        val corrs: {corr_str}", flush=True)
 
     elapsed = time.time() - t0
-    print(f"\n=== TRAINING DONE in {elapsed:.0f}s ===", flush=True)
+    print(f"\n=== TRAINING DONE in {elapsed:.0f}s "
+          f"(+{t0 - t_pre:.0f}s encoding) ===", flush=True)
 
     # Final eval
     print("\nFinal val correlations (state head reading frozen encoder + predictor):",
@@ -271,6 +315,11 @@ def main():
         "state_mean": state_mean,
         "state_std": state_std,
         "state_names": state_names,
+        # Needed to rebuild ActionEncoder: >0 selects the discrete Embedding
+        # branch. Without it a loader defaults to 0 and builds the MLP branch,
+        # which cannot accept this state_dict.
+        "num_actions": train_ds.num_actions,
+        "game": train_ds.game,
         "val_correlations": dict(zip(state_names, corrs)),
         "epochs": args.epochs,
         "lr": args.lr,

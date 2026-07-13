@@ -162,14 +162,24 @@ class PixelEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ActionEncoder(nn.Module):
-    def __init__(self, action_dim=ACTION_DIM, embed_dim=EMBED_DIM):
+    """Discrete when num_actions > 0 (ALE: 6 for pong_v3, 18 for tennis_v3),
+    otherwise an MLP over a continuous action vector (synthetic PongWorld)."""
+
+    def __init__(self, action_dim=ACTION_DIM, embed_dim=EMBED_DIM, num_actions=0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(action_dim, 4 * embed_dim), nn.SiLU(),
-            nn.Linear(4 * embed_dim, embed_dim),
-        )
+        self.num_actions = num_actions
+        if num_actions > 0:
+            self.embed = nn.Embedding(num_actions, embed_dim)
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(action_dim, 4 * embed_dim), nn.SiLU(),
+                nn.Linear(4 * embed_dim, embed_dim),
+            )
 
     def forward(self, action):
+        """action: (..., action_dim) float, or (...) long when discrete."""
+        if self.num_actions > 0:
+            return self.embed(action.long())
         return self.net(action)
 
 
@@ -203,17 +213,18 @@ class ARPredictor(nn.Module):
 
 class JEPAPool(nn.Module):
     def __init__(self, embed_dim=EMBED_DIM, heads=16, dim_head=64,
-                 n_layers=6, ff_dim=2048, state_dim=0):
+                 n_layers=6, ff_dim=2048, state_dim=0, num_actions=0):
         """
         state_dim: if > 0, adds an auxiliary state head that maps the predictor's
                    output embedding directly to a structured state vector. Trained
                    jointly with the predictor via L_total = L_embed + lambda * L_state.
                    When state_dim = 0 the model has no state head.
+        num_actions: > 0 selects a discrete action embedding (ALE envs).
         """
         super().__init__()
         self.encoder = PixelEncoder(hidden_dim=embed_dim)
         self.projector = ProjectorMLP(embed_dim, embed_dim, hidden_dim=PROJ_HIDDEN)
-        self.action_encoder = ActionEncoder(embed_dim=embed_dim)
+        self.action_encoder = ActionEncoder(embed_dim=embed_dim, num_actions=num_actions)
         self.predictor = ARPredictor(embed_dim, heads=heads, dim_head=dim_head,
                                       n_layers=n_layers, ff_dim=ff_dim)
         self.pred_projector = ProjectorMLP(embed_dim, embed_dim, hidden_dim=PROJ_HIDDEN)
@@ -234,17 +245,23 @@ class JEPAPool(nn.Module):
         e = self.projector(h)
         return e.reshape(B, T, -1)
 
+    def encode_actions(self, actions):
+        """actions: (B, T, action_dim) float, or (B, T) long when discrete -> (B, T, embed_dim)"""
+        if self.action_encoder.num_actions > 0:
+            return self.action_encoder(actions)
+        B, T = actions.shape[:2]
+        return self.action_encoder(actions.reshape(B * T, -1)).reshape(B, T, -1)
+
     def forward(self, frames, actions, states=None):
         """
         frames: (B, T, 3, H, W) -- T = history_size + 1 = 4
-        actions: (B, T, 2) -- per frame
+        actions: (B, T, 2) float, or (B, T) long when discrete
         states: (B, T, state_dim) -- ground-truth state per frame (optional)
         """
         B, T = frames.shape[:2]
         emb = self.encode(frames)
 
-        action_flat = actions.reshape(B * T, -1)
-        action_emb = self.action_encoder(action_flat).reshape(B, T, -1)
+        action_emb = self.encode_actions(actions)
 
         ctx_emb = emb[:, :HISTORY_SIZE]
         ctx_action = action_emb[:, :HISTORY_SIZE]
@@ -291,10 +308,8 @@ class JEPAPool(nn.Module):
 
     def rollout(self, seed_frames, seed_actions, future_actions, n_steps):
         emb = self.encode(seed_frames)
-        B = emb.shape[0]
 
-        action_flat = seed_actions.reshape(B * seed_actions.shape[1], -1)
-        action_emb_list = list(self.action_encoder(action_flat).reshape(B, -1, EMBED_DIM).unbind(1))
+        action_emb_list = list(self.encode_actions(seed_actions).unbind(1))
         emb_list = list(emb.unbind(1))
 
         predictions = []
@@ -333,177 +348,158 @@ class StateProbe(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    pa = argparse.ArgumentParser(description="Train JEPA Pong World Model")
-    pa.add_argument("--data", required=True)
+    import time
+
+    from model.lance_data import WindowBatcher, load_arrays, make_windows
+
+    pa = argparse.ArgumentParser(description="Train JEPA arcade world model (stage 1)")
+    pa.add_argument("--data", required=True, help="Path to a .lance dataset")
+    pa.add_argument("--limit", type=int, default=None, help="Use only the first N rows")
     pa.add_argument("--epochs", type=int, default=100)
-    pa.add_argument("--batch-size", type=int, default=64)
-    pa.add_argument("--checkpoint", default="checkpoints/jepa_pong.pt")
+    pa.add_argument("--batch-size", type=int, default=256)
+    pa.add_argument("--checkpoint", default="checkpoints/jepa_arcade.pt")
     pa.add_argument("--device", default="cuda")
     pa.add_argument("--probe-epochs", type=int, default=50)
+    pa.add_argument("--lr", type=float, default=5e-5)
+    pa.add_argument("--decode-threads", type=int, default=16)
     args = pa.parse_args()
 
-    # Load data
-    d = np.load(args.data)
-    frames_raw = d["frames"]   # (N, 128, 128, 3) uint8
-    states = torch.from_numpy(d["states"]).float()
-    actions = torch.from_numpy(d["actions"]).float()
-    episodes = d["episodes"]
-
-    # Convert frames to (N, 3, 128, 128) float [0, 1]
-    frames = torch.from_numpy(frames_raw).float().permute(0, 3, 1, 2) / 255.0
-
-    # Build 4-frame windows respecting episodes
-    windows_f, windows_a, windows_s = [], [], []
-    for i in range(HISTORY_SIZE, len(frames)):
-        if episodes[i] != episodes[i - HISTORY_SIZE]:
-            continue
-        windows_f.append(frames[i - HISTORY_SIZE: i + 1])
-        windows_a.append(actions[i - HISTORY_SIZE: i + 1])
-        windows_s.append(states[i])
-
-    windows_f = torch.stack(windows_f)
-    windows_a = torch.stack(windows_a)
-    windows_s = torch.stack(windows_s)
-    print(f"Dataset: {len(windows_f)} windows from {len(frames)} frames")
-
-    # Device
     device = torch.device(args.device if args.device != "auto" else
                           ("cuda" if torch.cuda.is_available() else "cpu"))
+    amp = device.type == "cuda"
 
-    # Model
-    model = JEPAPool().to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"JEPAPool: {n_params:,} params on {device}")
+    t0 = time.time()
+    frames, actions, states, episode, meta = load_arrays(
+        args.data, limit=args.limit, decode_threads=args.decode_threads)
+    windows = make_windows(episode, HISTORY_SIZE)
+    state_dim = states.shape[1]
+    print(f"{meta['game']}: {len(windows)} windows from {len(frames)} frames "
+          f"({frames.numel() / 1e9:.1f} GB uint8, decoded in {time.time() - t0:.0f}s)")
+    print(f"  num_actions={meta['num_actions']}  state_dim={state_dim} {meta['state_cols']}")
 
-    # Optimizer
-    opt = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
+    # Normalise states once, on the frames the windows actually touch.
+    s_mean = states[windows].mean(0)
+    s_std = states[windows].std(0).clamp(min=1e-6)
+    states_n = (states - s_mean) / s_std
+
+    batcher = WindowBatcher(frames, actions, states_n, windows, HISTORY_SIZE, device)
+
+    model = JEPAPool(num_actions=meta["num_actions"]).to(device)
+    model.encoder = model.encoder.to(memory_format=torch.channels_last)
+    print(f"JEPAPool: {sum(p.numel() for p in model.parameters()):,} params on {device}")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3, fused=amp)
     warmup_epochs = 5
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs - warmup_epochs)
     SIGREG_LAMBDA = 0.09
     bs = args.batch_size
+    n_win = len(windows)
 
-    # =====================================================
-    # JEPA Training
-    # =====================================================
     print(f"\n=== JEPA Training: {args.epochs} epochs ===")
-
     for epoch in range(args.epochs):
-        perm = torch.randperm(len(windows_f))
+        perm = torch.randperm(n_win)
         e_pred, e_reg, n = 0.0, 0.0, 0
         model.train()
+        t_ep = time.time()
 
-        for i in range(0, len(windows_f), bs):
-            idx = perm[i:i + bs]
-            xb = windows_f[idx].to(device)
-            ab = windows_a[idx].to(device)
+        for i in range(0, n_win, bs):
+            sel = perm[i:i + bs]
+            xb, ab, _ = batcher.batch(sel)
 
-            pred_loss, sigreg_loss, _, _ = model(xb, ab)
-            loss = pred_loss + SIGREG_LAMBDA * sigreg_loss
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+                pred_loss, sigreg_loss, _, _ = model(xb, ab)
+                loss = pred_loss + SIGREG_LAMBDA * sigreg_loss
 
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
-            e_pred += pred_loss.item() * len(idx)
-            e_reg += sigreg_loss.item() * len(idx)
-            n += len(idx)
+            e_pred += pred_loss.item() * len(sel)
+            e_reg += sigreg_loss.item() * len(sel)
+            n += len(sel)
 
         if epoch < warmup_epochs:
             for pg in opt.param_groups:
-                pg['lr'] = 5e-5 * (epoch + 1) / warmup_epochs
+                pg["lr"] = args.lr * (epoch + 1) / warmup_epochs
         else:
             scheduler.step()
 
-        lr = opt.param_groups[0]['lr']
-        print(f"Epoch {epoch+1}/{args.epochs}  "
-              f"L_pred={e_pred/n:.4f}  SIGReg={e_reg/n:.4f}  lr={lr:.2e}")
+        print(f"Epoch {epoch+1}/{args.epochs}  L_pred={e_pred/n:.4f}  "
+              f"SIGReg={e_reg/n:.4f}  lr={opt.param_groups[0]['lr']:.2e}  "
+              f"({time.time() - t_ep:.0f}s)", flush=True)
 
         if (epoch + 1) % 10 == 0:
             os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
             torch.save({"model": model.state_dict(), "epoch": epoch + 1,
-                         "embed_dim": EMBED_DIM}, args.checkpoint)
-            print(f"  -> saved: {args.checkpoint}")
+                        "embed_dim": EMBED_DIM, "num_actions": meta["num_actions"],
+                        "game": meta["game"]}, args.checkpoint)
 
+    os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
     torch.save({"model": model.state_dict(), "epoch": args.epochs,
-                 "embed_dim": EMBED_DIM}, args.checkpoint)
+                "embed_dim": EMBED_DIM, "num_actions": meta["num_actions"],
+                "game": meta["game"]}, args.checkpoint)
 
     # =====================================================
-    # State Probe
+    # State Probe -- on frozen predicted latents
     # =====================================================
     print(f"\n=== State Probe Training: {args.probe_epochs} epochs ===")
-    actual_state_dim = windows_s.shape[1]  # auto-detect: 10 for Pong
-    probe = StateProbe(state_dim=actual_state_dim).to(device)
-    print(f"Probe output dim: {actual_state_dim}")
+    probe = StateProbe(state_dim=state_dim).to(device)
     probe_opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
 
-    s_mean = windows_s.mean(0)
-    s_std = windows_s.std(0).clamp(min=1e-6)
-
     model.eval()
-    print("Encoding predicted latents for probe training...")
-    all_emb = []
+    print("Encoding predicted latents...")
+    all_emb, all_tgt = [], []
     with torch.no_grad():
-        for i in range(0, len(windows_f), bs):
-            batch_f = windows_f[i:i+bs].to(device)
-            batch_a = windows_a[i:i+bs].to(device)
-            emb = model.encode(batch_f)
-            ctx = emb[:, :HISTORY_SIZE]
-            B_b = batch_a.shape[0]
-            a_flat = batch_a[:, :HISTORY_SIZE].reshape(B_b * HISTORY_SIZE, -1)
-            ctx_a = model.action_encoder(a_flat).reshape(B_b, HISTORY_SIZE, -1)
-            pred = model.predict_next(ctx, ctx_a)
-            all_emb.append(pred.cpu())
+        for i in range(0, n_win, bs):
+            sel = torch.arange(i, min(i + bs, n_win))
+            xb, ab, sb = batcher.batch(sel)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+                emb = model.encode(xb)
+                ctx_a = model.encode_actions(ab[:, :HISTORY_SIZE])
+                pred = model.predict_next(emb[:, :HISTORY_SIZE], ctx_a)
+            all_emb.append(pred.float())
+            all_tgt.append(sb[:, -1])          # state at the window's last frame
     all_emb = torch.cat(all_emb)
-    states_n = (windows_s - s_mean) / s_std
+    all_tgt = torch.cat(all_tgt)
 
-    best_val = float('inf')
     n_tr = int(len(all_emb) * 0.9)
-
+    best_val = float("inf")
     for epoch in range(args.probe_epochs):
         probe.train()
-        perm = torch.randperm(n_tr)
+        perm = torch.randperm(n_tr, device=device)
         for i in range(0, n_tr, bs * 2):
             idx = perm[i:i + bs * 2]
-            pred = probe(all_emb[idx].to(device))
-            loss = F.mse_loss(pred, states_n[idx].to(device))
-            probe_opt.zero_grad()
+            loss = F.mse_loss(probe(all_emb[idx]), all_tgt[idx])
+            probe_opt.zero_grad(set_to_none=True)
             loss.backward()
             probe_opt.step()
 
         probe.eval()
         with torch.no_grad():
-            val = F.mse_loss(probe(all_emb[n_tr:].to(device)),
-                             states_n[n_tr:].to(device)).item()
-        if val < best_val:
-            best_val = val
-
+            val = F.mse_loss(probe(all_emb[n_tr:]), all_tgt[n_tr:]).item()
+        best_val = min(best_val, val)
         if (epoch + 1) % 10 == 0:
-            print(f"  Probe epoch {epoch+1}/{args.probe_epochs}  "
-                  f"val={val:.4f}  best={best_val:.4f}")
+            print(f"  Probe epoch {epoch+1}/{args.probe_epochs}  val={val:.4f}  best={best_val:.4f}",
+                  flush=True)
 
     probe.eval()
     with torch.no_grad():
-        pred = probe(all_emb[n_tr:].to(device)).cpu()
-        tgt = states_n[n_tr:]
-        for i in range(actual_state_dim):
-            c = np.corrcoef(pred[:, i].numpy(), tgt[:, i].numpy())[0, 1]
-            print(f"  state[{i}]: corr={c:+.3f}")
+        p = probe(all_emb[n_tr:]).cpu().numpy()
+        t = all_tgt[n_tr:].cpu().numpy()
+    for i, name in enumerate(meta["state_cols"]):
+        print(f"  {name:10s}: corr={np.corrcoef(p[:, i], t[:, i])[0, 1]:+.3f}")
 
     ckpt = torch.load(args.checkpoint, weights_only=False)
-    ckpt["probe"] = probe.state_dict()
-    ckpt["state_mean"] = s_mean
-    ckpt["state_std"] = s_std
+    ckpt.update({"probe": probe.state_dict(), "state_mean": s_mean, "state_std": s_std,
+                 "state_cols": meta["state_cols"]})
     torch.save(ckpt, args.checkpoint)
     print(f"Probe saved -> {args.checkpoint}")
 
-    # Quick rollout test
     print("\n=== Rollout Test ===")
-    model.eval()
     with torch.no_grad():
-        seed = windows_f[:1].to(device)
-        seed_a = windows_a[:1].to(device)
-        future_a = torch.zeros(1, 10, ACTION_DIM, device=device)
-        preds = model.rollout(seed, seed_a, future_a, n_steps=10)
-        print(f"Rollout: {preds.shape}")
-        print(f"  std={preds.std():.4f}  drift={((preds[:,0]-preds[:,-1]).norm()):.4f}")
+        xb, ab, _ = batcher.batch(torch.arange(1))
+        future_a = torch.randint(0, meta["num_actions"], (1, 10), device=device)
+        preds = model.rollout(xb[:, :HISTORY_SIZE], ab[:, :HISTORY_SIZE], future_a, n_steps=10)
+        print(f"Rollout: {tuple(preds.shape)}  std={preds.std():.4f}  "
+              f"drift={(preds[:, 0] - preds[:, -1]).norm():.4f}")
