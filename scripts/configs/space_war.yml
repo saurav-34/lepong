@@ -1,0 +1,36 @@
+# Space War (PettingZoo Atari `space_war_v2`) — 2-player, 18 actions each.
+#   python scripts/collect_pettingzoo.py --config scripts/configs/space_war.yml
+#
+# Policy: sticky-action random (the standard Atari data-collection policy, Machado et
+# al. 2018 — repeat the previous action with prob `repeat_prob`, else uniform random).
+# For a rotate/thrust/fire shooter this is the right default: holding an action lets a
+# ship build velocity and fire in bursts (real duels), which i.i.d. `random` never does
+# and which needs no per-game hand-tuning. Swap to a proper aim-at-opponent heuristic
+# once the ship (x,y) and angle->screen mapping are fully reverse-engineered.
+env: space_war_v2
+
+frames: 100000
+out: datasets/space_war_ma_128x128.lance
+img_size: 128
+frameskip: 4
+seed: 0
+
+# JEPA's action is stored as `action`; the other seat as `action_human`.
+agents:
+  jepa: second_0
+  human: first_0
+
+policy: sticky
+repeat_prob: 0.25
+
+# Verified by wiggle-probe (2026-07-15): byte 6/7 = each ship's heading (4-bit, 0-15;
+# RIGHT decrements). byte 47/48 = each ship's position (strongly ship-isolated under
+# thrust; axis x-vs-y not yet disambiguated — treat as a coarse position coordinate).
+# The rest of the ship state (full x/y, velocity, shots) is not reverse-engineered yet.
+state:
+  6: first_heading
+  7: second_heading
+  47: first_pos
+  48: second_pos
+
+velocity: {}

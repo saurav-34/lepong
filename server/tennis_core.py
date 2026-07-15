@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from model.jepa_pool import JEPAPool, EMBED_DIM, HISTORY_SIZE
+from model.jepa_pool import JEPAPool, EMBED_DIM, HISTORY_SIZE, resolve_state_meta
 
 logger = logging.getLogger("tennis")
 
@@ -34,6 +34,7 @@ logger = logging.getLogger("tennis")
 NOOP, FIRE, UP, RIGHT, LEFT, DOWN = 0, 1, 2, 3, 4, 5
 ALIGN_DEADZONE = 6                       # px, same as the collector
 AGENT_JEPA, AGENT_HUMAN = "second_0", "first_0"
+
 
 
 def rom_dir() -> str:
@@ -48,9 +49,12 @@ def load_frozen_model(checkpoint: str, device: torch.device):
     """
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
 
-    state_dim = ckpt.get("state_dim", 0)
+    # Accept both conventions (stage-2 state_dim/state_names, stage-1 state_cols).
+    state_dim, state_names, state_mean, state_std = resolve_state_meta(ckpt)
     if state_dim <= 0:
         raise RuntimeError(f"needs a state-head checkpoint, got state_dim={state_dim}")
+    if state_mean is None or state_std is None:
+        raise RuntimeError("checkpoint has no state_mean/state_std; cannot denormalize")
 
     # num_actions decides which ActionEncoder branch exists: >0 builds the
     # Embedding, 0 builds an MLP that cannot accept this state_dict. Checkpoints
@@ -65,9 +69,8 @@ def load_frozen_model(checkpoint: str, device: torch.device):
         num_actions = int(w.shape[0])
         logger.warning("num_actions absent; inferred %d from embed.weight", num_actions)
 
-    state_names = ckpt.get("state_names")
     if not state_names:
-        raise RuntimeError("checkpoint has no state_names; cannot map head outputs")
+        raise RuntimeError("checkpoint has no state_names/state_cols; cannot map head outputs")
     state_idx = {n: i for i, n in enumerate(state_names)}
     for required in ("ball_x", "player_x", "enemy_x"):
         if required not in state_idx:
@@ -81,8 +84,8 @@ def load_frozen_model(checkpoint: str, device: torch.device):
     model.eval().to(device)
 
     return (model,
-            ckpt["state_mean"].to(device),
-            ckpt["state_std"].to(device),
+            state_mean.to(device),
+            state_std.to(device),
             state_idx)
 
 
@@ -144,12 +147,16 @@ class TennisSession:
     """One tennis_v3 match driven by the frozen world model."""
 
     def __init__(self, checkpoint: str, device: torch.device, frameskip: int = 4,
-                 img_size: int = 128, seed: int = 0):
+                 img_size: int = 128, seed: int = 0, predict_k: int = 1):
         from pettingzoo.atari import tennis_v3
 
         self.device = device
         self.frameskip = frameskip
         self.img_size = img_size
+        # How many steps to roll the world model forward before reading the ball.
+        # k=1 re-anchors to real pixels every tick; k>1 predicts further ahead so
+        # JEPA aims where the ball WILL be, trading lead time for compounding error.
+        self.predict_k = max(1, int(predict_k))
         self.model, self.state_mean, self.state_std, self.state_idx = \
             load_frozen_model(checkpoint, device)
 
@@ -180,17 +187,38 @@ class TennisSession:
     def _predict_state(self) -> np.ndarray | None:
         if len(self.hist_emb) < HISTORY_SIZE:
             return None
-        ctx = torch.stack(self.hist_emb).unsqueeze(0)                    # (1,H,D)
-        a_idx = torch.tensor(self.hist_act, device=self.device).unsqueeze(0)
-        ctx_a = self.model.action_encoder(a_idx)                         # (1,H,D)
-        pred = self.model.predict_next(ctx, ctx_a)                       # (1,D)
-        s_norm = self.model.state_head(pred)[0]
+        # Roll the predictor forward predict_k steps, feeding each predicted
+        # embedding back into the context and holding the last action (the same
+        # persistence approximation step() uses). k=1 is a single one-step
+        # prediction re-anchored to real pixels; k>1 keeps extrapolating from its
+        # own predictions, so error compounds but the read leads further ahead.
+        emb = list(self.hist_emb)                                        # each (D,)
+        act = list(self.hist_act)                                        # each action id
+        pred = None
+        for _ in range(self.predict_k):
+            ctx = torch.stack(emb[-HISTORY_SIZE:]).unsqueeze(0)          # (1,H,D)
+            a_idx = torch.tensor(act[-HISTORY_SIZE:], device=self.device).unsqueeze(0)
+            ctx_a = self.model.action_encoder(a_idx)                     # (1,H,D)
+            pred = self.model.predict_next(ctx, ctx_a)[0]               # (D,)
+            emb.append(pred)
+            act.append(self.prev_action)                                # persist action
+        s_norm = self.model.state_head(pred.unsqueeze(0))[0]
         return (s_norm * self.state_std + self.state_mean).cpu().numpy()
 
     @torch.no_grad()
     def step(self, human_action: int = NOOP) -> dict:
         """Advance one decision tick (= frameskip ALE frames). Returns telemetry."""
         if not self.env.agents:
+            self._reset_point()
+
+        # Anchor JEPA to its native (top) end. The ROM swaps court ends every
+        # couple games (second0_is_top flips), but the reactive align-then-swing
+        # policy only rallies from the top -- on the bottom it chases a
+        # mispredicted ball into a corner and stalls. When the ends flip off top,
+        # reset the match to the native orientation so JEPA keeps playing its good
+        # end. The running tally in self.score is not touched, so the score the
+        # client shows carries across the restart.
+        if not second0_is_top(self.ale.getRAM()):
             self._reset_point()
 
         small, raw = self._render()
@@ -241,6 +269,7 @@ class TennisSession:
             "score": {"jepa": self.score[AGENT_JEPA], "human": self.score[AGENT_HUMAN]},
             "tick": self.tick,
             "history_ready": len(self.hist_emb) == HISTORY_SIZE,
+            "predict_k": self.predict_k,
         }
 
     def close(self):

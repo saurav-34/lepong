@@ -1,0 +1,44 @@
+# Tennis (PettingZoo Atari `tennis_v3`) — reproduces collect_tennis.py via the
+# generic collector:
+#   python scripts/collect_pettingzoo.py --config scripts/configs/tennis.yml
+#
+# JEPA controls second_0 = TOP player (RAM[27] x); human is first_0 = BOTTOM (RAM[26]
+# x). Firing LOCKS movement, so the heuristic MOVES with RIGHT/LEFT to align x, then
+# FIREs to swing. Players change court ends after odd cumulative games (RAM[71]+[72]),
+# which swaps which x-addr each seat drives — handled by the tennis_chase heuristic.
+# NOTE: RAM[17] is ball ARC-HEIGHT, not court-y; stored as ball_y but treat as suspect.
+env: tennis_v3
+
+frames: 50000
+out: datasets/tennis_ma_128x128.lance
+img_size: 128
+frameskip: 4
+seed: 0
+
+agents:
+  jepa: second_0     # TOP player
+  human: first_0     # BOTTOM player
+
+policy: heuristic
+epsilon: 0.35        # balances rallies/swings with full 18-action coverage
+
+state:
+  26: player_x       # bottom
+  24: player_y
+  27: enemy_x        # top
+  25: enemy_y
+  16: ball_x
+  17: ball_y         # arc-height, suspect (see note)
+
+velocity:
+  ball_vx: {source: ball_x, cap: 50.0}
+  ball_vy: {source: ball_y, cap: 50.0}
+
+heuristic:
+  name: tennis_chase
+  ball_x_addr: 16
+  bottom_x_addr: 26  # first_0's x-addr at game 1
+  top_x_addr: 27     # second_0's x-addr at game 1
+  games_addrs: [71, 72]   # end-swap after odd cumulative games
+  deadzone: 6
+  actions: {fire: 1, right: 3, left: 4}

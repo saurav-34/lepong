@@ -1,0 +1,38 @@
+# Pong (PettingZoo Atari `pong_v3`) — reproduces collect_pong.py via the generic
+# collector:  python scripts/collect_pettingzoo.py --config scripts/configs/pong.yml
+#
+# JEPA controls second_0 = LEFT paddle (RAM[50]); human is first_0 = RIGHT paddle
+# (RAM[51]). ball_y==0 (not ball_x) means no ball in play -> the heuristic must FIRE
+# to serve or the point deadlocks.
+env: pong_v3
+
+frames: 400000
+out: datasets/pong_ma_128x128.lance
+img_size: 128
+frameskip: 4
+seed: 0
+
+agents:
+  jepa: second_0     # LEFT paddle
+  human: first_0     # RIGHT paddle
+
+policy: heuristic
+epsilon: 0.30        # random actions mixed in for 6-action coverage
+
+state:
+  51: player_y       # right paddle
+  50: enemy_y        # left paddle
+  49: ball_x
+  54: ball_y
+
+velocity:
+  ball_vx: {source: ball_x, cap: 24.0}
+  ball_vy: {source: ball_y, cap: 24.0}
+
+heuristic:
+  name: pong_chase
+  ball_y_addr: 54
+  paddle_y_addr: {first_0: 51, second_0: 50}
+  paddle_half: 10    # RAM y is the paddle top; aim its centre at the ball
+  deadzone: 4
+  actions: {noop: 0, serve: 1, up: 2, down: 3}

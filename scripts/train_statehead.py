@@ -87,8 +87,9 @@ def precompute_features(model: JEPAPool, loader, device):
     the same PNGs and re-runs the same 13M-param CNN to get the same numbers, so
     we do it once. Also skips SIGReg, which model.forward computes and discards.
 
-    Returns (feats (N, HISTORY_SIZE, embed_dim), targets (N, HISTORY_SIZE,
-    state_dim), mean pred_loss) -- pred_loss is constant, so it is reported once.
+    Returns (feats (N, embed_dim), targets (N, state_dim), mean pred_loss) --
+    one row per window, the last predicted position only (matching predict_next).
+    pred_loss is constant, so it is reported once.
     """
     feats, targets = [], []
     pred_sum, n = 0.0, 0
@@ -101,15 +102,20 @@ def precompute_features(model: JEPAPool, loader, device):
 
         emb = model.encode(xb)
         action_emb = model.encode_actions(ab)
+        # Match the deployed readout (predict_next -> state_head): keep ONLY the
+        # last predicted position. pred_raw[:, :-1] are predictions made from a
+        # shorter causal context (1..HISTORY_SIZE-1 frames) and give noisier state
+        # readouts; training/scoring on them dragged corr below jepa_pool's joint
+        # diagnostic, which uses pred_raw[:, -1] alone -- and left the shipped head
+        # fit to positions the play path never sees.
         pred_raw = model.predictor(emb[:, :HISTORY_SIZE], action_emb[:, :HISTORY_SIZE])
-        pred_emb = model.pred_projector(
-            pred_raw.reshape(b * HISTORY_SIZE, -1)).reshape(b, HISTORY_SIZE, -1)
+        pred_emb = model.pred_projector(pred_raw[:, -1])              # (b, D)
 
-        pred_sum += (pred_emb - emb[:, 1:HISTORY_SIZE + 1]).pow(2).mean().item() * b
+        pred_sum += (pred_emb - emb[:, -1]).pow(2).mean().item() * b
         n += b
 
         feats.append(pred_emb)
-        targets.append(sb[:, 1:HISTORY_SIZE + 1])
+        targets.append(sb[:, -1])                                    # state at last frame
 
         if step == 1 or step == total or step % max(1, total // 10) == 0:
             print(f"    encoding {step}/{total} ({100.0 * step / total:5.1f}%)", flush=True)

@@ -1,4 +1,0 @@
-[2026-07-10T00:38:56Z WARN  lance::dataset::write::insert] No existing dataset at datasets/tennis_ma_128x128_100k.lance, it will be created
-tennis_v3 ready. agents=['first_0', 'second_0']  action_space={'first_0': np.int64(18), 'second_0': np.int64(18)}  frameskip=4
-Collecting 100000 transitions at 128px, policy=heuristic (epsilon=0.35) (both agents)...
-Done! 100000 transitions saved to datasets/tennis_ma_128x128_100k.lance

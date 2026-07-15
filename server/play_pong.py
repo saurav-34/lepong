@@ -1,64 +1,61 @@
-"""FastAPI WebSocket server for human-vs-JEPA Tennis (PettingZoo tennis_v3).
+"""FastAPI WebSocket server for human-vs-JEPA Pong (PettingZoo pong_v3).
 
 Unlike server/infer.py -- where the browser owns a synthetic Pong and the server
 only perceives -- ALE cannot run in a browser, so here the server owns the env
 and the client is a renderer plus a keyboard. Frames flow server -> client;
 actions flow client -> server.
 
-All env/model/policy logic lives in server/tennis_core.py so it can be driven
+All env/model/policy logic lives in server/pong_core.py so it can be driven
 headlessly; this module only moves bytes.
 
 Usage:
-    python -m server.play_tennis --port 8792
-    # defaults to the joint head in checkpoints/lepong_tennis_v1.pt; pass
-    # --checkpoint checkpoints/lepong_tennis_statehead.pt for the stage-2 head.
+    python -m server.play_pong --checkpoint checkpoints/lepong_atari_statehead.pt --port 8793
 """
 import argparse
-import asyncio
 import logging
 import pathlib
 
+import asyncio
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-from server.tennis_core import (AGENT_HUMAN, AGENT_JEPA, NOOP, TennisSession,
-                                png_b64)
+from server.pong_core import (AGENT_HUMAN, AGENT_JEPA, NOOP, PongSession, png_b64)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("tennis")
+logger = logging.getLogger("pong")
 
 _cfg = argparse.Namespace()
 
-app = FastAPI(title="lepong-tennis", version="1.0.0")
+app = FastAPI(title="lepong-pong", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "game": "tennis_v3",
+    return {"status": "ok", "game": "pong_v3",
             "jepa_agent": AGENT_JEPA, "human_agent": AGENT_HUMAN,
-            "policy": "align-then-swing on state_head(predict_next(pixels))"}
+            "policy": "align-then-move on state_head(predict_next(pixels)).ball_y"}
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    p = pathlib.Path(__file__).parent.parent / "client" / "tennis.html"
+    p = pathlib.Path(__file__).parent.parent / "client" / "pong_play.html"
     if not p.exists():
         return HTMLResponse(f"<h1>Client not found at {p}</h1>", status_code=404)
     return HTMLResponse(p.read_text())
 
 
-@app.websocket("/ws-tennis")
-async def tennis_endpoint(ws: WebSocket):
+@app.websocket("/ws-pong")
+async def pong_endpoint(ws: WebSocket):
     await ws.accept()
     logger.info("Client connected")
 
     try:
-        session = TennisSession(_cfg.checkpoint, torch.device(_cfg.device),
-                                frameskip=_cfg.frameskip, img_size=_cfg.img_size,
-                                seed=_cfg.seed, predict_k=_cfg.predict_k)
+        session = PongSession(_cfg.checkpoint, torch.device(_cfg.device),
+                              frameskip=_cfg.frameskip, img_size=_cfg.img_size,
+                              seed=_cfg.seed)
     except Exception as e:
         logger.error("Model load failed: %s", e, exc_info=True)
         await ws.send_json({"error": str(e)})
@@ -73,13 +70,7 @@ async def tennis_endpoint(ws: WebSocket):
         while True:
             msg = await ws.receive_json()
             a = int(msg.get("action", NOOP))
-            human_action = a if 0 <= a < 18 else NOOP
-            # Live rollout-depth knob: the client ships its current k each frame.
-            if "predict_k" in msg:
-                try:
-                    session.predict_k = max(1, int(msg["predict_k"]))
-                except (TypeError, ValueError):
-                    pass
+            human_action = a if 0 <= a < 6 else NOOP
 
     reader = asyncio.create_task(read_actions())
     dt = _cfg.frameskip / 60.0            # ALE runs at 60 Hz
@@ -106,18 +97,11 @@ async def tennis_endpoint(ws: WebSocket):
 def main():
     global _cfg
     pa = argparse.ArgumentParser()
-    # Defaults to the jointly-trained stage-1 head baked into the v1 checkpoint;
-    # pass a stage-2 checkpoint (train_statehead.py) for the refit/occlusion head.
-    pa.add_argument("--checkpoint", default="checkpoints/lepong_tennis_v1.pt")
-    pa.add_argument("--port", type=int, default=8792)
+    pa.add_argument("--checkpoint", required=True)
+    pa.add_argument("--port", type=int, default=8793)
     pa.add_argument("--host", default="0.0.0.0")
     pa.add_argument("--frameskip", type=int, default=4,
                     help="Must match the collector's stride (default 4).")
-    pa.add_argument("--predict-k", type=int, default=1,
-                    help="World-model rollout depth before reading the ball. 1 = "
-                         "one-step prediction re-anchored to pixels every tick; "
-                         ">1 predicts k steps ahead (aims where the ball will be, "
-                         "but error compounds).")
     pa.add_argument("--img-size", type=int, default=128)
     pa.add_argument("--display-scale", type=int, default=2)
     pa.add_argument("--seed", type=int, default=0)
@@ -125,7 +109,7 @@ def main():
     _cfg = pa.parse_args()
 
     import uvicorn
-    logger.info("Tennis server on %s:%d  (JEPA=%s top, human=%s bottom)",
+    logger.info("Pong server on %s:%d  (JEPA=%s left, human=%s right)",
                 _cfg.host, _cfg.port, AGENT_JEPA, AGENT_HUMAN)
     uvicorn.run(app, host=_cfg.host, port=_cfg.port, log_level="info")
 

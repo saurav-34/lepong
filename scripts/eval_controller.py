@@ -132,7 +132,6 @@ def load_frozen_model(checkpoint_path: str, device: torch.device):
     model = model.to(device)
     state_mean = ckpt.get("state_mean", torch.zeros(state_dim)).to(device)
     state_std = ckpt.get("state_std", torch.ones(state_dim)).to(device)
-    return model, state_mean, state_std
 
 
 def jepa_paddle_policy(

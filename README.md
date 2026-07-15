@@ -52,16 +52,16 @@ python -m model.jepa_pool --data data/pong_v1.npz --epochs 100 \
     --checkpoint checkpoints/lepong_v1.pt --device cuda
 
 # 3. Train the frozen state head (~3 min on an L4 GPU)
-python scripts/train_statehead.py \
+python -m scripts.train_statehead \
     --data data/pong_v1.npz \
     --init checkpoints/lepong_v1.pt \
     --output checkpoints/lepong_statehead_frozen.pt \
     --epochs 20 --batch 128 --lr 1e-3
 
 # 4. Evaluate
-python scripts/eval_ood.py --checkpoint checkpoints/lepong_statehead_frozen.pt
-python scripts/eval_controller.py --checkpoint checkpoints/lepong_statehead_frozen.pt
-python scripts/eval_occlusion.py --checkpoints checkpoints/lepong_statehead_frozen.pt
+python -m scripts.eval_ood --checkpoint checkpoints/lepong_statehead_frozen.pt
+python -m scripts.eval_controller --checkpoint checkpoints/lepong_statehead_frozen.pt
+python -m scripts.eval_occlusion --checkpoints checkpoints/lepong_statehead_frozen.pt
 ```
 
 ## Results

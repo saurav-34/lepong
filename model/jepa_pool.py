@@ -4,8 +4,8 @@ Architecture:
   - PixelEncoder: CNN for 128x128 RGB images -> 192-dim embedding
   - ActionEncoder: 2-float [left_dy, right_dy] -> 192-dim embedding
   - ARPredictor: 6-layer causal transformer with AdaLN-zero conditioning
-  - StateProbe: MLP that reads structured state from embeddings
-  - Optional state_head: Linear(192, 10) auxiliary head for direct state readout
+  - state_head: Linear(192, state_dim) readout, trained jointly (--state-lambda)
+    and refit on the frozen backbone in stage 2 (scripts/train_statehead.py)
 
 13M parameters total. Runs at ~20fps on CPU.
 """
@@ -23,7 +23,33 @@ EMBED_DIM = 192
 HISTORY_SIZE = 3
 PROJ_HIDDEN = 2048
 ACTION_DIM = 2    # [left_paddle_dy, right_paddle_dy]
-STATE_DIM = 28    # default probe output dim (overridden for Pong's 10-dim state)
+STATE_DIM = 28    # default state_head output dim (overridden per-game, e.g. Pong=10)
+
+
+def resolve_state_meta(ckpt, default_dim=0):
+    """Normalize state-head metadata across the two checkpoint conventions.
+
+    train_statehead.py (stage 2) saves ``state_dim`` and ``state_names``; the
+    jointly-trained checkpoint from this module (stage 1) omits ``state_dim`` and
+    stores the column list as ``state_cols``. Loaders must accept either so a raw
+    ``lepong_*_v1.pt`` and a refit ``*_statehead.pt`` are interchangeable.
+
+    Returns (state_dim, state_names_or_None, state_mean_or_None, state_std_or_None).
+    ``state_dim`` is taken verbatim when present, else inferred from the length of
+    the saved stats / names, else ``default_dim``.
+    """
+    mean = ckpt.get("state_mean")
+    std = ckpt.get("state_std")
+    names = ckpt.get("state_names") or ckpt.get("state_cols")
+    dim = ckpt.get("state_dim")
+    if not dim:
+        if mean is not None:
+            dim = len(mean)
+        elif names is not None:
+            dim = len(names)
+        else:
+            dim = default_dim
+    return dim, names, mean, std
 
 
 # ---------------------------------------------------------------------------
@@ -149,12 +175,22 @@ class PixelEncoder(nn.Module):
             nn.Conv2d(128, hidden_dim, 4, stride=2, padding=1),  # 8x8
             nn.BatchNorm2d(hidden_dim), nn.GELU(),
         )
-        self.pool = nn.AdaptiveAvgPool2d(1)
+        # Global average pooling alone dilutes a small bright object (e.g. a
+        # 1-2px Atari ball) across the full 8x8=64-cell grid: its contribution
+        # to the mean is ~1/64 of one cell's activation. AdaptiveMaxPool2d
+        # keeps the single strongest cell's response, then pool_fuse lets the
+        # model combine the peak (ball/paddle location) with the average
+        # (broader scene context) instead of only ever seeing the blurred mean.
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.maxpool = nn.AdaptiveMaxPool2d(1)
+        self.pool_fuse = nn.Linear(2 * hidden_dim, hidden_dim)
 
     def forward(self, img):
         """img: (B, 3, 128, 128) float [0,1] -> (B, hidden_dim)"""
         x = self.convs(img)
-        return self.pool(x).flatten(1)
+        avg = self.avgpool(x).flatten(1)
+        mx = self.maxpool(x).flatten(1)
+        return self.pool_fuse(torch.cat([avg, mx], dim=1))
 
 
 # ---------------------------------------------------------------------------
@@ -326,24 +362,6 @@ class JEPAPool(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# State Probe
-# ---------------------------------------------------------------------------
-
-class StateProbe(nn.Module):
-    def __init__(self, embed_dim=EMBED_DIM, state_dim=STATE_DIM):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim, 256), nn.ReLU(), nn.Dropout(0.1),
-            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.1),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, state_dim),
-        )
-
-    def forward(self, z):
-        return self.net(z)
-
-
-# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -359,14 +377,31 @@ if __name__ == "__main__":
     pa.add_argument("--batch-size", type=int, default=256)
     pa.add_argument("--checkpoint", default="checkpoints/jepa_arcade.pt")
     pa.add_argument("--device", default="cuda")
-    pa.add_argument("--probe-epochs", type=int, default=50)
     pa.add_argument("--lr", type=float, default=5e-5)
     pa.add_argument("--decode-threads", type=int, default=16)
+    pa.add_argument("--sigreg-lambda", type=float, default=0.05,
+                    help="Weight on the SIGReg term (was hardcoded 0.09)")
+    pa.add_argument("--state-lambda", type=float, default=1.0,
+                    help="Weight on the auxiliary state-head loss. Ground-truth ball/paddle "
+                         "state is known at collection time -- supervising it jointly during "
+                         "stage 1 gives the encoder a direct gradient for small/sparse objects "
+                         "like the ball, instead of relying on the self-supervised pred+SIGReg "
+                         "objective to discover them incidentally.")
+    pa.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
+    pa.add_argument("--wandb-project", default="lepong")
+    pa.add_argument("--wandb-entity", default="ssaurav3425-iiser-bhopal")
+    pa.add_argument("--wandb-run-name", default=None)
     args = pa.parse_args()
 
     device = torch.device(args.device if args.device != "auto" else
                           ("cuda" if torch.cuda.is_available() else "cpu"))
     amp = device.type == "cuda"
+
+    wandb = None
+    if args.wandb:
+        import wandb
+        wandb.init(project=args.wandb_project, entity=args.wandb_entity,
+                   name=args.wandb_run_name, config=vars(args))
 
     t0 = time.time()
     frames, actions, states, episode, meta = load_arrays(
@@ -376,6 +411,10 @@ if __name__ == "__main__":
     print(f"{meta['game']}: {len(windows)} windows from {len(frames)} frames "
           f"({frames.numel() / 1e9:.1f} GB uint8, decoded in {time.time() - t0:.0f}s)")
     print(f"  num_actions={meta['num_actions']}  state_dim={state_dim} {meta['state_cols']}")
+    if wandb is not None:
+        wandb.config.update({"game": meta["game"], "num_actions": meta["num_actions"],
+                             "state_dim": state_dim, "state_cols": meta["state_cols"],
+                             "n_windows": len(windows), "n_frames": len(frames)})
 
     # Normalise states once, on the frames the windows actually touch.
     s_mean = states[windows].mean(0)
@@ -384,31 +423,33 @@ if __name__ == "__main__":
 
     batcher = WindowBatcher(frames, actions, states_n, windows, HISTORY_SIZE, device)
 
-    model = JEPAPool(num_actions=meta["num_actions"]).to(device)
+    model = JEPAPool(num_actions=meta["num_actions"], state_dim=state_dim).to(device)
     model.encoder = model.encoder.to(memory_format=torch.channels_last)
     print(f"JEPAPool: {sum(p.numel() for p in model.parameters()):,} params on {device}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3, fused=amp)
     warmup_epochs = 5
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs - warmup_epochs)
-    SIGREG_LAMBDA = 0.09
+    SIGREG_LAMBDA = args.sigreg_lambda
+    STATE_LAMBDA = args.state_lambda
     bs = args.batch_size
     n_win = len(windows)
 
-    print(f"\n=== JEPA Training: {args.epochs} epochs ===")
+    print(f"\n=== JEPA Training: {args.epochs} epochs  sigreg_lambda={SIGREG_LAMBDA}  "
+          f"state_lambda={STATE_LAMBDA} ===")
     for epoch in range(args.epochs):
         perm = torch.randperm(n_win)
-        e_pred, e_reg, n = 0.0, 0.0, 0
+        e_pred, e_reg, e_state, n = 0.0, 0.0, 0.0, 0
         model.train()
         t_ep = time.time()
 
         for i in range(0, n_win, bs):
             sel = perm[i:i + bs]
-            xb, ab, _ = batcher.batch(sel)
+            xb, ab, sb = batcher.batch(sel)
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-                pred_loss, sigreg_loss, _, _ = model(xb, ab)
-                loss = pred_loss + SIGREG_LAMBDA * sigreg_loss
+                pred_loss, sigreg_loss, _, _, state_loss, _, _ = model(xb, ab, sb)
+                loss = pred_loss + SIGREG_LAMBDA * sigreg_loss + STATE_LAMBDA * state_loss
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -417,6 +458,7 @@ if __name__ == "__main__":
 
             e_pred += pred_loss.item() * len(sel)
             e_reg += sigreg_loss.item() * len(sel)
+            e_state += state_loss.item() * len(sel)
             n += len(sel)
 
         if epoch < warmup_epochs:
@@ -426,8 +468,13 @@ if __name__ == "__main__":
             scheduler.step()
 
         print(f"Epoch {epoch+1}/{args.epochs}  L_pred={e_pred/n:.4f}  "
-              f"SIGReg={e_reg/n:.4f}  lr={opt.param_groups[0]['lr']:.2e}  "
+              f"SIGReg={e_reg/n:.4f}  L_state={e_state/n:.4f}  lr={opt.param_groups[0]['lr']:.2e}  "
               f"({time.time() - t_ep:.0f}s)", flush=True)
+        if wandb is not None:
+            wandb.log({"epoch": epoch + 1, "train/pred_loss": e_pred / n,
+                       "train/sigreg_loss": e_reg / n, "train/state_loss": e_state / n,
+                       "train/total_loss": e_pred / n + SIGREG_LAMBDA * e_reg / n + STATE_LAMBDA * e_state / n,
+                       "lr": opt.param_groups[0]["lr"], "epoch_time_s": time.time() - t_ep})
 
         if (epoch + 1) % 10 == 0:
             os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
@@ -441,12 +488,13 @@ if __name__ == "__main__":
                 "game": meta["game"]}, args.checkpoint)
 
     # =====================================================
-    # State Probe -- on frozen predicted latents
+    # State readout diagnostic -- corr of the (already-trained) joint state_head
+    # on frozen predicted latents. This is the SAME linear head deployed at play
+    # time (predict_state -> state_head), so its per-column corr is the honest
+    # signal; no separate probe is trained. Stage 2 (train_statehead.py) is the
+    # one place that refits this head to convergence on the frozen backbone.
     # =====================================================
-    print(f"\n=== State Probe Training: {args.probe_epochs} epochs ===")
-    probe = StateProbe(state_dim=state_dim).to(device)
-    probe_opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
-
+    print("\n=== State readout diagnostic (joint state_head, frozen backbone) ===")
     model.eval()
     print("Encoding predicted latents...")
     all_emb, all_tgt = [], []
@@ -463,38 +511,29 @@ if __name__ == "__main__":
     all_emb = torch.cat(all_emb)
     all_tgt = torch.cat(all_tgt)
 
+    # Held-out split, comparable to stage 2's val corrs.
     n_tr = int(len(all_emb) * 0.9)
-    best_val = float("inf")
-    for epoch in range(args.probe_epochs):
-        probe.train()
-        perm = torch.randperm(n_tr, device=device)
-        for i in range(0, n_tr, bs * 2):
-            idx = perm[i:i + bs * 2]
-            loss = F.mse_loss(probe(all_emb[idx]), all_tgt[idx])
-            probe_opt.zero_grad(set_to_none=True)
-            loss.backward()
-            probe_opt.step()
-
-        probe.eval()
-        with torch.no_grad():
-            val = F.mse_loss(probe(all_emb[n_tr:]), all_tgt[n_tr:]).item()
-        best_val = min(best_val, val)
-        if (epoch + 1) % 10 == 0:
-            print(f"  Probe epoch {epoch+1}/{args.probe_epochs}  val={val:.4f}  best={best_val:.4f}",
-                  flush=True)
-
-    probe.eval()
     with torch.no_grad():
-        p = probe(all_emb[n_tr:]).cpu().numpy()
+        p = model.state_head(all_emb[n_tr:]).cpu().numpy()
         t = all_tgt[n_tr:].cpu().numpy()
     for i, name in enumerate(meta["state_cols"]):
         print(f"  {name:10s}: corr={np.corrcoef(p[:, i], t[:, i])[0, 1]:+.3f}")
+    if wandb is not None:
+        wandb.log({f"corr/{name}": np.corrcoef(p[:, i], t[:, i])[0, 1]
+                   for i, name in enumerate(meta["state_cols"])})
 
+    # Save the deploy-format keys the servers require (tennis_core/pong_core/infer
+    # load_frozen_model reads state_dim + state_names + state_mean/std). The joint
+    # state_head is trained here on states normalized by exactly these s_mean/s_std,
+    # so this checkpoint is directly playable WITHOUT a stage-2 refit -- stage 2
+    # (train_statehead.py) only adds a frozen-backbone refit + keep_live filtering.
     ckpt = torch.load(args.checkpoint, weights_only=False)
-    ckpt.update({"probe": probe.state_dict(), "state_mean": s_mean, "state_std": s_std,
+    ckpt.update({"state_mean": s_mean, "state_std": s_std,
+                 "state_dim": state_dim,
+                 "state_names": meta["state_cols"],
                  "state_cols": meta["state_cols"]})
     torch.save(ckpt, args.checkpoint)
-    print(f"Probe saved -> {args.checkpoint}")
+    print(f"State stats saved -> {args.checkpoint} (directly playable)")
 
     print("\n=== Rollout Test ===")
     with torch.no_grad():
@@ -503,3 +542,8 @@ if __name__ == "__main__":
         preds = model.rollout(xb[:, :HISTORY_SIZE], ab[:, :HISTORY_SIZE], future_a, n_steps=10)
         print(f"Rollout: {tuple(preds.shape)}  std={preds.std():.4f}  "
               f"drift={(preds[:, 0] - preds[:, -1]).norm():.4f}")
+
+    if wandb is not None:
+        wandb.log({"rollout/std": preds.std().item(),
+                   "rollout/drift": (preds[:, 0] - preds[:, -1]).norm().item()})
+        wandb.finish()

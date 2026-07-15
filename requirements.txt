@@ -1,0 +1,9 @@
+# Packages needed for Atari data collection + JEPA training that aren't
+# already in the base conda env (torch, torchvision, numpy, pillow, h5py,
+# pyarrow, fastapi, uvicorn, websockets are inherited via --system-site-packages).
+opencv-python-headless
+pylance
+pettingzoo[atari]
+ale-py
+autorom[accept-rom-license]
+wandb
