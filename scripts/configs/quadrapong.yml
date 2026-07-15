@@ -1,0 +1,51 @@
+# Quadrapong (PettingZoo Atari `quadrapong_v4`) — 4 players, 6 actions each.
+#   python scripts/collect_pettingzoo.py --config scripts/configs/quadrapong.yml
+#
+# 4 edge paddles, 2 teams (docs: Team 1 = first_0 + third_0, Team 2 = second_0 +
+# fourth_0). Built on the Pong ROM: ball is bytes 49(x)/54(y) and reads 0 when no
+# ball is in play (serve needs FIRE), exactly like Pong.
+#
+# Paddle layout (verified by extreme-position pixel diff, 2026-07-15):
+#   agent      edge     axis         tracks   paddle-byte   team
+#   first_0    bottom   horizontal   ball_x   60            1
+#   second_0   top      horizontal   ball_x   59            2
+#   third_0    right    vertical     ball_y   62            1
+#   fourth_0   left     vertical     ball_y   61            2
+#
+# POLICY: sticky-action random for now (good coverage today — paddles move and the
+# ball rallies via bounces). A per-paddle ball-chasing heuristic (`quadrapong_chase`)
+# gives much better data (real interceptions); see quadrapong_heuristic_plan.md for
+# the verified facts + the one remaining calibration step, then flip `policy` to
+# heuristic and fill in the `heuristic:` block.
+env: quadrapong_v4
+
+frames: 100000
+out: datasets/quadrapong_ma_128x128.lance
+img_size: 128
+frameskip: 4
+seed: 0
+
+# NOTE on `agents`: the generic collector conditions the world model on ONE seat
+# (`jepa`, stored as `action`) and stores ONE other seat as `action_human`; the other
+# two paddles are still driven (same policy) but their actions are not columns. Pick
+# the JEPA seat = the paddle the human-vs-JEPA game will hand to the model. Defaulting
+# to first_0 (bottom) as JEPA and its teammate third_0 (right) as the reference.
+agents:
+  jepa: first_0      # bottom paddle (Team 1)
+  human: third_0     # right paddle (Team 1, teammate) — reference column
+
+policy: sticky
+repeat_prob: 0.25
+
+# Verified state bytes (see table above). Ball 49/54 == 0 means no ball in play.
+state:
+  49: ball_x
+  54: ball_y
+  60: paddle_bottom   # first_0
+  59: paddle_top      # second_0
+  62: paddle_right    # third_0
+  61: paddle_left     # fourth_0
+
+velocity:
+  ball_vx: {source: ball_x, cap: 24.0}
+  ball_vy: {source: ball_y, cap: 24.0}

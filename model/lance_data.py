@@ -23,12 +23,15 @@ STATE_COLUMNS = {
     "pong": ["player_y", "enemy_y", "ball_x", "ball_y", "ball_vx", "ball_vy"],
     "tennis": ["player_x", "player_y", "enemy_x", "enemy_y",
                "ball_x", "ball_y", "ball_vx", "ball_vy"],
+    "boxing": ["first_x", "first_y", "second_x", "second_y"],
 }
-NUM_ACTIONS = {"pong": 6, "tennis": 18}
+NUM_ACTIONS = {"pong": 6, "tennis": 18, "boxing": 18}
 
 
 def infer_game(path: str) -> str:
     names = set(lance.dataset(path).schema.names)
+    if "first_x" in names:
+        return "boxing"
     return "tennis" if "player_x" in names else "pong"
 
 

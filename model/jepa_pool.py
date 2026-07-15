@@ -288,38 +288,87 @@ class JEPAPool(nn.Module):
         B, T = actions.shape[:2]
         return self.action_encoder(actions.reshape(B * T, -1)).reshape(B, T, -1)
 
-    def forward(self, frames, actions, states=None):
+    def forward(self, frames, actions, states=None, rollout_steps=1, discount=1.0):
         """
-        frames: (B, T, 3, H, W) -- T = history_size + 1 = 4
+        frames: (B, T, 3, H, W) -- T = HISTORY_SIZE + rollout_steps
         actions: (B, T, 2) float, or (B, T) long when discrete
         states: (B, T, state_dim) -- ground-truth state per frame (optional)
+        rollout_steps: number of future frames to supervise. 1 reproduces the
+            original teacher-forced next-step objective exactly. When > 1 the
+            predictor is unrolled autoregressively on its OWN latents beyond the
+            first step, and each horizon is supervised against the real encoded
+            frame -- this is what trains the deploy-time ``rollout`` path and
+            fights the exposure bias that makes long rollouts drift.
+        discount: per-step weight decay applied to the compounding rollout loss
+            (horizon k contributes discount**k). Ignored when rollout_steps == 1.
+
+        Returns a dict of loss terms and diagnostic tensors. ``pred_loss`` and
+        ``state_loss`` are the dense teacher-forced 1-step terms (identical to the
+        original objective); ``roll_pred_loss`` / ``roll_state_loss`` are the extra
+        compounding terms (0 when rollout_steps == 1).
         """
-        B, T = frames.shape[:2]
-        emb = self.encode(frames)
+        B = frames.shape[0]
+        emb = self.encode(frames)                    # (B, T, D) -- real targets
+        action_emb = self.encode_actions(actions)    # (B, T, D)
 
-        action_emb = self.encode_actions(actions)
-
-        ctx_emb = emb[:, :HISTORY_SIZE]
-        ctx_action = action_emb[:, :HISTORY_SIZE]
-
-        pred_raw = self.predictor(ctx_emb, ctx_action)
-        pred_proj = self.pred_projector(pred_raw.reshape(B * HISTORY_SIZE, -1))
-        pred_emb = pred_proj.reshape(B, HISTORY_SIZE, -1)
-
-        tgt_emb = emb[:, 1:HISTORY_SIZE + 1]
-
-        pred_loss = (pred_emb - tgt_emb).pow(2).mean()
         sigreg_loss = self.sigreg(emb.transpose(0, 1))
 
-        # Auxiliary state head -- predicts NEXT-frame state from the predictor output
-        if self.state_head is not None and states is not None:
-            state_pred = self.state_head(pred_emb.reshape(B * HISTORY_SIZE, -1))
-            state_pred = state_pred.reshape(B, HISTORY_SIZE, -1)
+        # --- Dense teacher-forced 1-step loss over the seed context (unchanged) ---
+        ctx_emb = emb[:, :HISTORY_SIZE]
+        ctx_action = action_emb[:, :HISTORY_SIZE]
+        pred_raw = self.predictor(ctx_emb, ctx_action)
+        pred_emb = self.pred_projector(
+            pred_raw.reshape(B * HISTORY_SIZE, -1)).reshape(B, HISTORY_SIZE, -1)
+        tgt_emb = emb[:, 1:HISTORY_SIZE + 1]
+        pred_loss = (pred_emb - tgt_emb).pow(2).mean()
+
+        have_state = self.state_head is not None and states is not None
+        if have_state:
+            state_pred = self.state_head(
+                pred_emb.reshape(B * HISTORY_SIZE, -1)).reshape(B, HISTORY_SIZE, -1)
             tgt_states = states[:, 1:HISTORY_SIZE + 1]
             state_loss = (state_pred - tgt_states).pow(2).mean()
-            return pred_loss, sigreg_loss, pred_emb, tgt_emb, state_loss, state_pred, tgt_states
+        else:
+            state_loss = torch.zeros((), device=frames.device)
 
-        return pred_loss, sigreg_loss, pred_emb, tgt_emb
+        # --- Compounding autoregressive rollout loss (steps 2..rollout_steps) ---
+        roll_pred_loss = torch.zeros((), device=frames.device)
+        roll_state_loss = torch.zeros((), device=frames.device)
+        if rollout_steps > 1:
+            # Seed history with the real context, then the step-1 prediction
+            # already computed above (position -1 predicts frame HISTORY_SIZE).
+            emb_hist = list(emb[:, :HISTORY_SIZE].unbind(1))
+            emb_hist.append(pred_emb[:, -1])
+            p_losses, s_losses, weights = [], [], []
+            w = discount
+            for t in range(1, rollout_steps):
+                ctx = torch.stack(emb_hist[-HISTORY_SIZE:], dim=1)
+                ctx_a = action_emb[:, t:t + HISTORY_SIZE]
+                step_raw = self.predictor(ctx, ctx_a)
+                step_pred = self.pred_projector(step_raw[:, -1])   # (B, D)
+                tgt = emb[:, HISTORY_SIZE + t]
+                p_losses.append(w * (step_pred - tgt).pow(2).mean())
+                if have_state:
+                    sp = self.state_head(step_pred)
+                    st = states[:, HISTORY_SIZE + t]
+                    s_losses.append(w * (sp - st).pow(2).mean())
+                emb_hist.append(step_pred)
+                weights.append(w)
+                w *= discount
+            wsum = sum(weights)
+            roll_pred_loss = torch.stack(p_losses).sum() / wsum
+            if s_losses:
+                roll_state_loss = torch.stack(s_losses).sum() / wsum
+
+        return {
+            "pred_loss": pred_loss,
+            "sigreg_loss": sigreg_loss,
+            "state_loss": state_loss,
+            "roll_pred_loss": roll_pred_loss,
+            "roll_state_loss": roll_state_loss,
+            "pred_emb": pred_emb,
+            "tgt_emb": tgt_emb,
+        }
 
     def predict_next(self, ctx_emb, ctx_action):
         was_training = self.pred_projector.training
@@ -381,6 +430,22 @@ if __name__ == "__main__":
     pa.add_argument("--decode-threads", type=int, default=16)
     pa.add_argument("--sigreg-lambda", type=float, default=0.05,
                     help="Weight on the SIGReg term (was hardcoded 0.09)")
+    pa.add_argument("--rollout-steps", type=int, default=1,
+                    help="Future frames supervised per window. 1 = original teacher-forced "
+                         "next-step objective. >1 unrolls the predictor autoregressively on its "
+                         "own latents and supervises each horizon against the real frame, which "
+                         "trains the deploy-time rollout and reduces long-horizon drift.")
+    pa.add_argument("--rollout-discount", type=float, default=0.9,
+                    help="Per-step weight decay on the compounding rollout loss (horizon k gets "
+                         "discount**k). Downweights harder far-future steps. Only used when "
+                         "--rollout-steps > 1.")
+    pa.add_argument("--rollout-warmup-epochs", type=int, default=5,
+                    help="Linearly grow the effective rollout horizon from 1 to --rollout-steps "
+                         "over this many epochs (curriculum), so early training isn't supervised "
+                         "on garbage self-predicted latents. 0 disables the ramp.")
+    pa.add_argument("--rollout-lambda", type=float, default=1.0,
+                    help="Weight on the compounding rollout loss terms relative to the dense "
+                         "1-step terms.")
     pa.add_argument("--state-lambda", type=float, default=1.0,
                     help="Weight on the auxiliary state-head loss. Ground-truth ball/paddle "
                          "state is known at collection time -- supervising it jointly during "
@@ -406,7 +471,11 @@ if __name__ == "__main__":
     t0 = time.time()
     frames, actions, states, episode, meta = load_arrays(
         args.data, limit=args.limit, decode_threads=args.decode_threads)
-    windows = make_windows(episode, HISTORY_SIZE)
+    # A window must hold the seed context (HISTORY_SIZE) plus rollout_steps future
+    # frames, i.e. a span of HISTORY_SIZE + rollout_steps - 1 (== HISTORY_SIZE when
+    # rollout_steps == 1, reproducing the original 4-frame window).
+    window_span = HISTORY_SIZE + args.rollout_steps - 1
+    windows = make_windows(episode, window_span)
     state_dim = states.shape[1]
     print(f"{meta['game']}: {len(windows)} windows from {len(frames)} frames "
           f"({frames.numel() / 1e9:.1f} GB uint8, decoded in {time.time() - t0:.0f}s)")
@@ -421,7 +490,7 @@ if __name__ == "__main__":
     s_std = states[windows].std(0).clamp(min=1e-6)
     states_n = (states - s_mean) / s_std
 
-    batcher = WindowBatcher(frames, actions, states_n, windows, HISTORY_SIZE, device)
+    batcher = WindowBatcher(frames, actions, states_n, windows, window_span, device)
 
     model = JEPAPool(num_actions=meta["num_actions"], state_dim=state_dim).to(device)
     model.encoder = model.encoder.to(memory_format=torch.channels_last)
@@ -432,14 +501,26 @@ if __name__ == "__main__":
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs - warmup_epochs)
     SIGREG_LAMBDA = args.sigreg_lambda
     STATE_LAMBDA = args.state_lambda
+    ROLLOUT_LAMBDA = args.rollout_lambda
+    ROLLOUT_DISCOUNT = args.rollout_discount
     bs = args.batch_size
     n_win = len(windows)
 
+    def effective_rollout(epoch):
+        """Curriculum: ramp the horizon 1 -> rollout_steps over warmup epochs."""
+        if args.rollout_steps <= 1 or args.rollout_warmup_epochs <= 0:
+            return args.rollout_steps
+        frac = min(1.0, epoch / args.rollout_warmup_epochs)
+        return 1 + int(round((args.rollout_steps - 1) * frac))
+
     print(f"\n=== JEPA Training: {args.epochs} epochs  sigreg_lambda={SIGREG_LAMBDA}  "
-          f"state_lambda={STATE_LAMBDA} ===")
+          f"state_lambda={STATE_LAMBDA}  rollout_steps={args.rollout_steps} "
+          f"(warmup={args.rollout_warmup_epochs}, discount={ROLLOUT_DISCOUNT}, "
+          f"lambda={ROLLOUT_LAMBDA}) ===")
     for epoch in range(args.epochs):
         perm = torch.randperm(n_win)
-        e_pred, e_reg, e_state, n = 0.0, 0.0, 0.0, 0
+        e_pred, e_reg, e_state, e_roll, e_rstate, n = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+        r_steps = effective_rollout(epoch)
         model.train()
         t_ep = time.time()
 
@@ -448,17 +529,22 @@ if __name__ == "__main__":
             xb, ab, sb = batcher.batch(sel)
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-                pred_loss, sigreg_loss, _, _, state_loss, _, _ = model(xb, ab, sb)
-                loss = pred_loss + SIGREG_LAMBDA * sigreg_loss + STATE_LAMBDA * state_loss
+                out = model(xb, ab, sb, rollout_steps=r_steps, discount=ROLLOUT_DISCOUNT)
+                loss = (out["pred_loss"] + SIGREG_LAMBDA * out["sigreg_loss"]
+                        + STATE_LAMBDA * out["state_loss"]
+                        + ROLLOUT_LAMBDA * (out["roll_pred_loss"]
+                                            + STATE_LAMBDA * out["roll_state_loss"]))
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
-            e_pred += pred_loss.item() * len(sel)
-            e_reg += sigreg_loss.item() * len(sel)
-            e_state += state_loss.item() * len(sel)
+            e_pred += out["pred_loss"].item() * len(sel)
+            e_reg += out["sigreg_loss"].item() * len(sel)
+            e_state += out["state_loss"].item() * len(sel)
+            e_roll += out["roll_pred_loss"].item() * len(sel)
+            e_rstate += out["roll_state_loss"].item() * len(sel)
             n += len(sel)
 
         if epoch < warmup_epochs:
@@ -468,12 +554,17 @@ if __name__ == "__main__":
             scheduler.step()
 
         print(f"Epoch {epoch+1}/{args.epochs}  L_pred={e_pred/n:.4f}  "
-              f"SIGReg={e_reg/n:.4f}  L_state={e_state/n:.4f}  lr={opt.param_groups[0]['lr']:.2e}  "
-              f"({time.time() - t_ep:.0f}s)", flush=True)
+              f"SIGReg={e_reg/n:.4f}  L_state={e_state/n:.4f}  "
+              f"L_roll={e_roll/n:.4f}  L_rstate={e_rstate/n:.4f}  R={r_steps}  "
+              f"lr={opt.param_groups[0]['lr']:.2e}  ({time.time() - t_ep:.0f}s)", flush=True)
         if wandb is not None:
             wandb.log({"epoch": epoch + 1, "train/pred_loss": e_pred / n,
                        "train/sigreg_loss": e_reg / n, "train/state_loss": e_state / n,
-                       "train/total_loss": e_pred / n + SIGREG_LAMBDA * e_reg / n + STATE_LAMBDA * e_state / n,
+                       "train/roll_pred_loss": e_roll / n, "train/roll_state_loss": e_rstate / n,
+                       "train/rollout_steps": r_steps,
+                       "train/total_loss": (e_pred / n + SIGREG_LAMBDA * e_reg / n
+                                            + STATE_LAMBDA * e_state / n
+                                            + ROLLOUT_LAMBDA * (e_roll / n + STATE_LAMBDA * e_rstate / n)),
                        "lr": opt.param_groups[0]["lr"], "epoch_time_s": time.time() - t_ep})
 
         if (epoch + 1) % 10 == 0:
@@ -507,7 +598,9 @@ if __name__ == "__main__":
                 ctx_a = model.encode_actions(ab[:, :HISTORY_SIZE])
                 pred = model.predict_next(emb[:, :HISTORY_SIZE], ctx_a)
             all_emb.append(pred.float())
-            all_tgt.append(sb[:, -1])          # state at the window's last frame
+            # predict_next is 1-step, so the target is the state at frame
+            # HISTORY_SIZE (== the window's last frame only when rollout_steps==1).
+            all_tgt.append(sb[:, HISTORY_SIZE])
     all_emb = torch.cat(all_emb)
     all_tgt = torch.cat(all_tgt)
 

@@ -1,0 +1,54 @@
+# Boxing (PettingZoo Atari `boxing_v2`) — 2 boxers, 18 actions each.
+#   python scripts/collect_pettingzoo.py --config scripts/configs/boxing.yml
+#
+# The easy, clean case: both boxers' (x,y) live in the SAME RAM coordinate frame
+# (verified 2026-07-15 by wiggle-probe — x increases right, y increases down for both),
+# so a direct `opponent - self` chase is correct with NO pixel calibration. The whole
+# game is "close distance, punch when aligned", which the `boxing_chase` heuristic does.
+#
+#   first_0:  x=32  y=34        second_0: x=33  y=35
+#
+# JEPA controls first_0; second_0 is the reference/opponent seat (stored as action_human).
+env: boxing_v2
+
+frames: 100000
+out: datasets/boxing_ma_128x128.lance
+img_size: 128
+frameskip: 4
+seed: 0
+
+agents:
+  jepa: first_0
+  human: second_0
+
+policy: heuristic
+epsilon: 0.30          # random mixed in for full 18-action coverage the WM needs
+
+state:
+  32: first_x
+  34: first_y
+  33: second_x
+  35: second_y
+
+velocity: {}           # positions are absolute; no ball to velocity-track
+
+heuristic:
+  name: boxing_chase
+  pos:
+    first_0:  {x: 32, y: 34}
+    second_0: {x: 33, y: 35}
+  opponent: {first_0: second_0, second_0: first_0}
+  punch_range_x: 16    # horizontal reach to throw a punch
+  align_y: 8           # must be roughly level in y to land it
+  deadzone: 3          # px within which an axis is "close enough" (don't jitter)
+  actions:
+    up: 2
+    right: 3
+    left: 4
+    down: 5
+    upright: 6
+    upleft: 7
+    downright: 8
+    downleft: 9
+    rightfire: 11      # punch to the right
+    leftfire: 12       # punch to the left

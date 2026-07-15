@@ -91,7 +91,28 @@ def _tennis_chase(ram, agent, hp, rng):
     return a["right"] if dx > 0 else a["left"]
 
 
-HEURISTICS = {"pong_chase": _pong_chase, "tennis_chase": _tennis_chase}
+def _boxing_chase(ram, agent, hp, rng):
+    """Close the distance to the opponent and punch when aligned. Both boxers' (x,y)
+    are in the SAME RAM frame (x increases right, y increases down), so `opp - self`
+    is a correct chase with no calibration. When within horizontal punch range and
+    roughly level in y, throw a directional punch toward the opponent; otherwise step
+    (8-directional) toward them."""
+    a = hp["actions"]
+    me, opp = hp["pos"][agent], hp["pos"][hp["opponent"][agent]]
+    dx = int(ram[opp["x"]]) - int(ram[me["x"]])
+    dy = int(ram[opp["y"]]) - int(ram[me["y"]])
+    if abs(dx) <= hp["punch_range_x"] and abs(dy) <= hp["align_y"]:
+        return a["rightfire"] if dx >= 0 else a["leftfire"]   # punch toward opponent
+    h = None if abs(dx) <= hp["deadzone"] else ("right" if dx > 0 else "left")
+    v = None if abs(dy) <= hp["deadzone"] else ("down" if dy > 0 else "up")
+    if h and v:
+        return a[{"up": "upright", "down": "downright"}[v] if h == "right"
+                 else {"up": "upleft", "down": "downleft"}[v]]
+    return a[h or v]
+
+
+HEURISTICS = {"pong_chase": _pong_chase, "tennis_chase": _tennis_chase,
+              "boxing_chase": _boxing_chase}
 
 
 def main():
