@@ -41,3 +41,11 @@ env/
 # Scratch
 /tmp/
 start.md
+
+# Drafts & working notes (not part of the published repo)
+blog.md
+preview_readme.md
+fix.md
+digest.txt
+project.md
+architecture.md
