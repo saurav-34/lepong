@@ -1,0 +1,147 @@
+<meta charset="utf-8">
+<title>JEPA Boxing — human vs world model</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0d10; color: #d7dae0;
+         font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 24px; }
+  h1 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: .04em; }
+  #screen { image-rendering: pixelated; border: 1px solid #2a2f3a; border-radius: 4px; }
+  .row { display: flex; gap: 28px; align-items: flex-start; }
+  .panel { min-width: 260px; }
+  .k { color: #7d8494; }
+  .v { color: #e8ebf0; }
+  table { border-collapse: collapse; }
+  td { padding: 1px 10px 1px 0; white-space: nowrap; }
+  #status { color: #8b93a3; }
+  .live { color: #5ec27a; }
+  .warn { color: #d9a44a; }
+  kbd { background: #1a1e26; border: 1px solid #2a2f3a; border-radius: 3px;
+        padding: 1px 5px; color: #c8cdd6; }
+</style>
+
+<h1>JEPA Boxing — <span class="k">model plays white/left (first_0), you play black/right (second_0)</span></h1>
+
+<div class="row">
+  <canvas id="screen" width="320" height="420"></canvas>
+
+  <div class="panel">
+    <table>
+      <tr><td class="k">status</td><td class="v" id="status">connecting…</td></tr>
+      <tr><td class="k">score (jepa / you)</td><td class="v" id="score">0 / 0</td></tr>
+      <tr><td class="k">tick</td><td class="v" id="tick">0</td></tr>
+      <tr><td class="k">jepa action</td><td class="v" id="ja">—</td></tr>
+      <tr><td class="k">your action</td><td class="v" id="ha">—</td></tr>
+      <tr><td class="k">predict k (rollout)</td><td class="v" id="pk">—</td></tr>
+    </table>
+
+    <p class="k" style="margin-bottom:4px">predicted state (from pixels)</p>
+    <table id="pred"></table>
+
+    <p class="k" style="margin-bottom:4px">perception error vs RAM</p>
+    <table id="err"></table>
+
+    <p class="k">
+      <kbd>←</kbd><kbd>↑</kbd><kbd>↓</kbd><kbd>→</kbd> move &nbsp; <kbd>space</kbd> punch
+      &nbsp; <kbd>[</kbd><kbd>]</kbd> k−/k+
+    </p>
+    <p class="k" style="font-size:12px">
+      Space combines with a direction — punch while moving. Tap rather than hold:
+      the ROM fires a punch on the button's rising edge, so holding it just leaves
+      the arm out.
+    </p>
+  </div>
+</div>
+
+<script>
+// ALE full action set (18) for boxing_v2. Fire combines with a direction, so the
+// human can punch while moving.
+const NOOP = 0, FIRE = 1, UP = 2, RIGHT = 3, LEFT = 4, DOWN = 5;
+const UPRIGHT = 6, UPLEFT = 7, DOWNRIGHT = 8, DOWNLEFT = 9;
+const UPFIRE = 10, RIGHTFIRE = 11, LEFTFIRE = 12, DOWNFIRE = 13;
+const UPRIGHTFIRE = 14, UPLEFTFIRE = 15, DOWNRIGHTFIRE = 16, DOWNLEFTFIRE = 17;
+const ACTION_NAME = {
+  0:'NOOP', 1:'FIRE', 2:'UP', 3:'RIGHT', 4:'LEFT', 5:'DOWN',
+  6:'UPRIGHT', 7:'UPLEFT', 8:'DOWNRIGHT', 9:'DOWNLEFT',
+  10:'UPFIRE', 11:'RIGHTFIRE', 12:'LEFTFIRE', 13:'DOWNFIRE',
+  14:'UPRIGHTFIRE', 15:'UPLEFTFIRE', 16:'DOWNRIGHTFIRE', 17:'DOWNLEFTFIRE'
+};
+
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+const $ = id => document.getElementById(id);
+
+let predictK = 1, kInit = false;
+const K_MIN = 1, K_MAX = 12;
+
+const held = new Set();
+addEventListener('keydown', e => {
+  if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+  held.add(e.code);
+  if (!e.repeat) {
+    if (e.key === ']') predictK = Math.min(K_MAX, predictK + 1);
+    else if (e.key === '[') predictK = Math.max(K_MIN, predictK - 1);
+  }
+});
+addEventListener('keyup', e => held.delete(e.code));
+
+// Direction + fire -> one of the 18 discrete actions.
+function currentAction() {
+  const up = held.has('ArrowUp'), down = held.has('ArrowDown');
+  const left = held.has('ArrowLeft'), right = held.has('ArrowRight');
+  const fire = held.has('Space');
+  if (up && right)   return fire ? UPRIGHTFIRE : UPRIGHT;
+  if (up && left)    return fire ? UPLEFTFIRE : UPLEFT;
+  if (down && right) return fire ? DOWNRIGHTFIRE : DOWNRIGHT;
+  if (down && left)  return fire ? DOWNLEFTFIRE : DOWNLEFT;
+  if (up)    return fire ? UPFIRE : UP;
+  if (down)  return fire ? DOWNFIRE : DOWN;
+  if (left)  return fire ? LEFTFIRE : LEFT;
+  if (right) return fire ? RIGHTFIRE : RIGHT;
+  return fire ? FIRE : NOOP;
+}
+
+const url = (location.protocol === 'https:' ? 'wss://' : 'ws://')
+          + location.host + '/ws-boxing';
+const ws = new WebSocket(url);
+const img = new Image();
+img.onload = () => {
+  if (canvas.width !== img.width) { canvas.width = img.width; canvas.height = img.height; }
+  ctx.drawImage(img, 0, 0);
+};
+
+ws.onopen = () => { $('status').textContent = 'connected'; $('status').className = 'v live'; };
+ws.onclose = () => { $('status').textContent = 'disconnected'; $('status').className = 'v warn'; };
+ws.onerror = () => { $('status').textContent = 'error'; $('status').className = 'v warn'; };
+
+ws.onmessage = ev => {
+  const m = JSON.parse(ev.data);
+  if (m.error) { $('status').textContent = m.error; $('status').className = 'v warn'; return; }
+
+  img.src = 'data:image/png;base64,' + m.frame_png;
+
+  if (!kInit && m.predict_k !== undefined) { predictK = m.predict_k; kInit = true; }
+
+  // The server drives the clock; every frame it sends, we answer with a key state.
+  ws.send(JSON.stringify({ action: currentAction(), predict_k: predictK }));
+
+  $('status').textContent = m.history_ready ? 'playing' : 'filling history…';
+  $('status').className = m.history_ready ? 'v live' : 'v warn';
+  $('score').textContent = `${m.score.jepa} / ${m.score.opponent}`;
+  $('tick').textContent = m.tick;
+  $('ja').textContent = ACTION_NAME[m.jepa_action] ?? m.jepa_action;
+  $('ha').textContent = ACTION_NAME[m.opponent_action] ?? m.opponent_action;
+  $('pk').textContent = m.predict_k;
+
+  if (m.pred_state) {
+    $('pred').innerHTML = Object.entries(m.pred_state)
+      .map(([k, v]) => `<tr><td class="k">${k}</td><td class="v">${v.toFixed(1)}</td></tr>`)
+      .join('');
+  }
+  if (m.pred_err) {
+    $('err').innerHTML = Object.entries(m.pred_err)
+      .map(([k, v]) => `<tr><td class="k">${k}</td><td class="v">${v.toFixed(2)}</td></tr>`)
+      .join('');
+  }
+};
+</script>
