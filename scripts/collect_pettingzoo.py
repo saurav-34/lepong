@@ -4,17 +4,17 @@ Add a new game by writing `configs/<game>.yml` — no code changes are needed fo
 random-action path. This is a faithful superset of the hand-written collectors:
 `configs/pong.yml` and `configs/tennis.yml` reproduce collect_pong.py /
 collect_tennis.py exactly (same env, agent seat, RAM state map, velocities, and
-ball-chasing heuristic). `configs/space_war.yml` is the new game.
+ball-chasing heuristic). `configs/boxing.yml` adds a third game.
 
 What a config controls (see the shipped configs for full examples):
-  env         module name under `pettingzoo.atari` (e.g. space_war_v2)
+  env         module name under `pettingzoo.atari` (e.g. boxing_v2)
   agents      jepa/human seat -> agent id. JEPA's action is stored as `action`
               (what the world model is conditioned on); the other seat as `action_human`.
   frameskip   ALE frames per recorded transition. These envs step 1 ALE frame each,
               so we HOLD the chosen action this many env-steps -> the recorded stride
               equals the play stride (the train==play-stride lesson from Pong/Tennis).
   state       RAM byte -> state-field name. Leave `{}` for a game whose RAM has not
-              been reverse-engineered yet (Space War): only pixels+actions are stored.
+              been reverse-engineered yet: only pixels+actions are stored.
   velocity    output field -> {source: <state field>, cap: <px>}. Finite-difference of
               the source per transition; jumps larger than `cap` (serve teleports /
               off-screen) are written as 0.
@@ -25,7 +25,7 @@ What a config controls (see the shipped configs for full examples):
               registered ball-chasing policy + its params; see HEURISTICS below).
 
 Usage:
-  python scripts/collect_pettingzoo.py --config scripts/configs/space_war.yml
+  python scripts/collect_pettingzoo.py --config scripts/configs/boxing.yml
   python scripts/collect_pettingzoo.py --config scripts/configs/pong.yml --frames 400000
 CLI flags override the matching config keys (handy for sweeps without editing YAML).
 """
